@@ -1,0 +1,46 @@
+selected_profile: ark
+state_root: workspace/ianvs-agent
+approval_policy: manual
+wsl_distribution: Ubuntu-24.04
+wsl_python_executable: python3
+context_threshold: 0.78
+# 空值表示按当前模型窗口和输出预留计算输入空间。
+context_input_budget: null
+keep_recent_turns: 3
+# 累计次数与时间作为统计参考，不终止任务。
+max_model_calls: 40
+max_tool_calls: 100
+# 输入增量达到此周期的 context_threshold 时自动压缩，累计用量保持记录。
+max_input_tokens: 500000
+max_output_tokens: 100000
+max_task_seconds: 1800
+max_repair_attempts: 5
+run_timeout_seconds: 600
+tool_output_chars: 16000
+# 值为后端环境变量名称，实例审批绑定后才传给 Example。
+runtime_credentials:
+  DASHSCOPE_API_KEY: DASHSCOPE_API_KEY
+profiles:
+  ark:
+    name: 方舟主模型
+    model: ark-code-latest
+    base_url: https://ark.cn-beijing.volces.com/api/plan/v3
+    api_key_env: ARK_API_KEY
+    context_window: 256000
+    output_tokens: 8192
+    auxiliary_output_tokens: 2048
+    auxiliary_thinking: disabled
+    timeout_seconds: 120
+    request_timeout_seconds: 600
+    max_retries: 2
+  glm:
+    name: 方舟 GLM
+    model: glm-5.3
+    base_url: https://ark.cn-beijing.volces.com/api/plan/v3
+    api_key_env: ARK_API_KEY
+    context_window: 1024000
+    output_tokens: 8192
+    auxiliary_output_tokens: 2048
+    timeout_seconds: 120
+    request_timeout_seconds: 600
+    max_retries: 2

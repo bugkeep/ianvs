@@ -101,8 +101,20 @@ setup(
     maintainer=_infos.owners,
     maintainer_email="",
     include_package_data=True,
+    package_data={"ianvs_agent": ["app/*.tcss", "skills/*.md",
+                                   "requirements.txt", "frontend-requirements.txt",
+                                   "config.example.yaml"]},
+    extras_require={
+        "agent": [
+            requirement + "; python_version >= '3.11'"
+            for requirement in _infos._read_requirements(
+                os.path.join(os.path.dirname(__file__), "ianvs_agent", "requirements.txt")
+            )
+        ]
+    },
     entry_points={
-        "console_scripts": ["ianvs = core.cmd.benchmarking:main"]
+        "console_scripts": ["ianvs = core.cmd.benchmarking:main",
+                            "ianvs-agent = ianvs_agent.__main__:main"]
     },
     python_requires=">=3.6",
     long_description=_infos.long_desc,

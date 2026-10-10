@@ -18,6 +18,7 @@ import os
 import uuid
 
 from core.common.constant import SystemMetricType
+from core.common.events import emit_event, stage
 from core.testcasecontroller.metrics import get_metric_func
 
 
@@ -69,13 +70,23 @@ class TestCase:
                 test_env_config[k] = v
 
             self.output_dir = self._get_output_dir(workspace)
+            emit_event("testcase.started", testcase_id=str(self.id),
+                       algorithm=self.algorithm.name, output_dir=self.output_dir)
+            stage("algorithm_initialization", testcase_id=str(self.id))
             paradigm = self.algorithm.paradigm(workspace=self.output_dir,
                                                **test_env_config)
+            stage("algorithm_execution", testcase_id=str(self.id))
             res, system_metric_info = paradigm.run()
+            stage("metric_computation", testcase_id=str(self.id))
             test_result = self.compute_metrics(res, dataset, **system_metric_info)
+            emit_event("testcase.completed", testcase_id=str(self.id),
+                       algorithm=self.algorithm.name, output_dir=self.output_dir,
+                       metrics=test_result)
 
         except Exception as err:
             paradigm_type = self.algorithm.paradigm_type
+            emit_event("testcase.failed", testcase_id=str(self.id),
+                       error_type=type(err).__name__, error=str(err))
             raise RuntimeError(
                 f"(paradigm={paradigm_type}) pipeline runs failed, error: {err}") from err
         return test_result
