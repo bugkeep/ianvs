@@ -93,8 +93,10 @@ class CodeTools:
         target = self.code_path(path)
         if not target.exists():
             return {"path": target.relative_to(self.code_root).as_posix(), "source": str(target), "exists": False, "file_version": "absent", "start_line": start_line, "end_line": 0, "total_lines": 0, "content": "", "truncated": False, "ends_with_newline": False}
-        content, text, encoding, reason = self._source_text(target)
         relative = target.relative_to(self.code_root).as_posix()
+        if not stat.S_ISREG(target.stat().st_mode):
+            raise ValueError(f"读取路径必须为普通文件：{relative}")
+        content, text, encoding, reason = self._source_text(target)
         if reason:
             raise ValueError(f"无法作为文本读取 {relative}：{reason}；支持 UTF-8 及带 BOM 的 UTF-16/UTF-32")
         lines = text.splitlines()

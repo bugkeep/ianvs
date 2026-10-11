@@ -155,6 +155,39 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(path, refused["error"])
         self.assertIn("binary", refused["error"])
 
+    async def test_directory_read_records_tool_error_and_keeps_task_usable(self):
+        path = "examples/tool-check"
+        original_task = json.loads(json.dumps(self.harness.task))
+        original_state = json.loads(json.dumps(self.harness.state))
+        call = self.call("read_file", {"path": path})
+        refused = await self.harness._action(self.harness.tools.execute(call))
+        self.assertEqual(refused["status"], "error")
+        self.assertIn("普通文件", refused["error"])
+        self.assertIn(path, refused["error"])
+        self.assertIsNone(refused["data"])
+        self.assertFalse(self.harness.busy)
+        self.assertEqual(self.harness.task, original_task)
+        self.assertEqual(self.harness.state, original_state)
+
+        read = await self.harness._action(self.read_sample())
+        self.assertEqual(read["status"], "success")
+        self.assertEqual(read["data"]["content"], "1: value=before")
+        records = self.harness.store.read_events(self.harness.session_relative_path + "/tools.jsonl")
+        self.assertEqual([record["status"] for record in records], ["error", "success"])
+        self.assertEqual(records[0]["operation_id"], refused["operation_id"])
+        self.assertEqual(records[0]["call_id"], call["id"])
+        self.assertEqual(records[0]["arguments"], {"path": path})
+        self.assertEqual(records[0]["error"], refused["error"])
+        events = self.harness.store.read_events(self.harness.session_relative_path + "/events.jsonl")
+        failed = [event for event in events if event["event_type"] == "tool.failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["payload"]["operation_id"], refused["operation_id"])
+        self.assertFalse(any(event["event_type"] == "agent.failed" for event in events))
+        self.assertEqual(self.harness.task, original_task)
+        self.assertEqual(self.harness.state, original_state)
+        self.assertEqual(self.harness.usage.summary()["tool_calls"], 2)
+        self.assertEqual(self.harness.usage.summary()["model_calls"], 0)
+
     async def test_search_limit_300_pages_real_matches_and_keeps_full_output(self):
         path = "examples/tool-check/paged.txt"
         (self.code_root / path).write_text("".join(f"needle {index}\n" for index in range(305)), encoding="utf-8")
@@ -187,8 +220,6 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("missing.py", missing["error"])
         invalid = await self.harness.tools.execute(self.call("search_text", {"pattern": "[", "paths": ["examples/tool-check"]}))
         self.assertEqual(invalid["status"], "error")
-        with self.assertRaises(IsADirectoryError):
-            await self.harness.tools.execute(self.call("read_file", {"path": "examples/tool-check"}))
 
     @unittest.skipIf(os.name == "nt", "文件系统权限错误检查需要 Linux")
     async def test_search_preserves_actual_filesystem_permission_error(self):

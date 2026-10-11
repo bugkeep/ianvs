@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 
 from .packages import package_identity
+from .processes import runtime_environment
 
 IGNORED_DIRECTORIES = {".git", "workspace", "__pycache__", ".venv", "venv", "node_modules", ".agents", ".workbuddy", ".pytest_cache", ".idea"}
 IGNORED_FILES = {".git", "AGENTS.md", "SHARED_AGENTS.md"}
@@ -206,7 +207,7 @@ class InstanceManager:
         environment_changed = False
         environment = instance.get("environment") or {}
         if environment.get("status") == "ready":
-            package_check = subprocess.run([environment["python_executable"], "-m", "pip", "--disable-pip-version-check", "list", "--format=json"], cwd=instance["code_root"], capture_output=True, text=True, check=True, timeout=30)
+            package_check = subprocess.run([environment["python_executable"], "-m", "pip", "--disable-pip-version-check", "list", "--format=json"], cwd=instance["code_root"], env=runtime_environment(environment["python_executable"]), capture_output=True, text=True, check=True, timeout=30)
             environment_changed = package_identity(json.loads(package_check.stdout)) != package_identity(environment["packages"])
         if changed or environment_changed:
             instance["needs_verification"] = True

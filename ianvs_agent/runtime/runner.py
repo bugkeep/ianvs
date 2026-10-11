@@ -83,6 +83,8 @@ class Runner:
         return list(self._orphaned)
 
     async def run(self, instance, overrides=None):
+        if self._current is None and self._orphaned:
+            self.recover()
         if self._current is not None or self._orphaned:
             raise RuntimeError("已有运行或重启前仍活动的所属进程，请先取消或等待结束")
         overrides = overrides or {}

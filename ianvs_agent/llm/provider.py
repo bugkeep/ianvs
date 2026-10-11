@@ -87,13 +87,20 @@ class Provider:
 
     @staticmethod
     def _can_retry(error, telemetry):
-        if telemetry["response_received"] or telemetry["chunk_count"]:
+        if telemetry["phase"] not in {"connecting", "receiving"}:
             return False
         if isinstance(error, APIStatusError):
             return error.status_code in {408, 409, 429} or error.status_code >= 500
+        if isinstance(error, TimeoutError):
+            return True
         if isinstance(error, APIConnectionError):
-            return type(error.__cause__).__name__ in {"ConnectError", "ConnectTimeout", "PoolTimeout", "ProxyError"}
-        return False
+            error = error.__cause__
+        # 完整响应交付前不会执行工具；接收中断可重新请求，原始片段单独保留。
+        return isinstance(error, (
+            httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ProxyError,
+            httpx.ReadError, httpx.ReadTimeout, httpx.WriteError, httpx.WriteTimeout,
+            httpx.CloseError, httpx.RemoteProtocolError,
+        ))
 
     def _request(self, messages, tools, purpose):
         request = {
@@ -251,7 +258,8 @@ class Provider:
             seconds = self.profile.request_timeout_seconds if record["failure_stage"] == "absolute_deadline" else self.profile.timeout_seconds
             record["error"] = f"模型 {telemetry['purpose']} 请求达到{label} {seconds:g} 秒；收到 {telemetry['chunk_count']} 个数据片段，未完成的工具调用未执行。已有任务与证据保留，可通过 /resume 继续。"
         self._usage_fields(record, telemetry["raw_usage"])
-        will_retry = not cancelled and not record["context_limit"] and telemetry["attempt"] < telemetry.get("max_attempts", self.profile.max_retries + 1) and self._can_retry(error, telemetry)
+        record["retryable"] = not cancelled and not record["context_limit"] and self._can_retry(error, telemetry)
+        will_retry = record["retryable"] and telemetry["attempt"] < telemetry.get("max_attempts", self.profile.max_retries + 1)
         await self._io(self.usage.record, record)
         await self._io(self.usage.store.write, attempt_path, {
             "schema_version": 2, "purpose": telemetry["purpose"], "attempt": telemetry["attempt"],
@@ -324,6 +332,7 @@ class Provider:
                 raise
             except Exception as error:
                 record, will_retry = await self._failed(error, state, telemetry, request, attempt_path, estimated_input, retry_reason)
+                error.request_failure = record
                 if record["context_limit"]:
                     raise ContextLimitError("模型服务明确报告上下文超限") from error
                 if will_retry:

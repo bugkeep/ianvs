@@ -17,15 +17,15 @@
 
 - `Provider(profile, events, usage)`；`async complete(messages, tools=None, purpose="plan", retry_reason=None, *, max_attempts=None) -> dict`。`max_attempts` 为可选正整数，实际尝试上限为 `min(profile.max_retries + 1, max_attempts)`；默认沿用模型配置，非法值在请求前拒绝。
 - 响应：`content`、`tool_calls`（`id,name,arguments`，arguments 为 dict）、`usage`、`model`、`request_id`、`finish_reason`；原始消息另存 `raw_message`。
-- Provider 使用 SDK 流式接收并聚合完整响应，发布 `llm.delta`、`llm.progress` 和 `llm.retry`；仅可见回复进入界面。请求有总时限，读取超时或收到部分响应后不自动重复整个请求。未完成的工具参数不能执行。
+- Provider 使用 SDK 流式接收并聚合完整响应，发布 `llm.delta`、`llm.progress` 和 `llm.retry`；仅可见回复进入界面。`connecting/receiving` 阶段的明确连接、读取、写入、远端协议故障、请求总超时及 HTTP 408/409/429/5xx 可在配置次数内重试。失败记录保存 `retryable`，最终异常附带正式 `request_failure`；取消、认证、格式、上下文超限和存储错误分别处理。每次重试创建独立聚合状态，完整响应通过检查后才交付工具调用，原始失败片段与用量继续保留。
 - `context_input_budget` 默认 `None`（YAML `null`），输入空间按当前模型窗口减本次输出预留计算；显式正整数只用于缩小空间。自动压缩阈值为模型窗口扣除输出预留后的 78%，上限为显式输入预算。`auxiliary_output_tokens` 默认 2048。Observe 只发送当前完整工具交互及正式任务、状态与证据引用。主模型的辅助请求使用已核实支持的 `auxiliary_thinking: disabled`，GLM 保持服务默认配置。`max_input_tokens` 用于周期压缩；单次输入空间仍按模型配置检查。
 - `UsageTracker(store, session_relative_path, events)`：`record(record)`、`summary()`、`check_budget(settings)`；实际用量未知保持 null，估算另行标注。
 - `ContextManager(settings, store, events, provider)`；`async prepare(task, state, history, tools, role="plan", force_compact=False, correction=None) -> dict`，返回 `messages,tools,estimated_tokens,context_fraction,checkpoint_id`；`async compact(task,state,history,tools,manual=False)`。`correction` 仅用于 Observe，并在完整请求估算之前加入。
 - `async complete(task,state,history,tools,role="plan",purpose="plan",force_compact=False,correction=None,retry_reason=None,max_attempts=None,allow_text=False)` 负责准备请求、Plan 周期压缩、调用模型及服务明确报告上下文超限后的单次压缩重试；Observe 格式纠正请求遇到服务上下文超限时直接失败。`prepare(...,allow_text=False)` 同样支持该参数；纯文字 Plan 后使用 Observe 的 `allow_text=True`，只发送当前末尾完整交互与正式状态，模型判断继续或现实阻塞。
 - Plan 在 `task_effective_input_tokens - budget_base_input_tokens + estimated_tokens >= max_input_tokens * context_threshold` 时检查周期压缩，默认参考量500000、比例78%。基准来自上次成功检查点的 `task_input_tokens_at_completion`；旧检查点依据 `model_requests` 对应的真实 Usage 恢复基准。候选摘要须有完整旧交互、预计节省后续输入且符合模型单次输入窗口。后续 Plan/Observe 的估算继续保存供统计，不构成累计额度门禁。摘要调用使用 `purpose="compaction",max_attempts=1`，完成后重建 Plan。
-- 输入周期压缩记录保存于会话的 `context/input-budget/<task_id>.json`。实际摘要前保存 `status=attempted`，完成后更新为 `completed` 并保存检查点；请求历史 fingerprint 与当前检查点共同限制相同历史的重复摘要，新增完整历史可以再次触发。检查点与事件带 `trigger="task_input_budget"`，手动压缩和窗口压缩独立处理。
+- 输入周期压缩记录保存于会话的 `context/input-budget/<task_id>.json`。实际摘要前保存 `status=attempted`，完成后更新为 `completed` 并保存检查点。摘要请求的正式失败记录标记 `retryable=true` 且已准备 Plan 仍符合输入窗口时，保存 `status=deferred`、失败请求引用和失败后的累计用量，发布 `context.compaction_deferred`，继续该 Plan。请求历史 fingerprint 与当前检查点共同限制相同历史的重复摘要，新增完整历史可以再次触发。检查点与事件带 `trigger="task_input_budget"`，手动压缩和窗口压缩独立处理。
 - 预检无法压缩时保存 `status=skipped` 与原因，相同历史、检查点及已用量不重复检查，相同原因不重复发布 `context.compaction_skipped`。新增完整历史可以重新检查；无法节省时继续当前任务。工具发送范围按模型单次窗口限定，保留配对 ID 与全文证据引用，范围选择不产生摘要或压缩事件。
-- `compact(..., manual=True)` 没有可压缩的旧交互时返回 `status=skipped,reason=no_older_history,message`，发送一次 `context.compaction_skipped`，不改正式任务与验证结果、不调用模型。窗口压缩及服务超限恢复使用 `manual=False`，无法满足模型单次输入空间时明确报告失败。Harness 消费排队请求后清除标志。
+- `compact(..., manual=True)` 没有可压缩的旧交互时返回 `status=skipped,reason=no_older_history,message`，发送一次 `context.compaction_skipped`，不改正式任务与验证结果、不调用模型。`prepare(...,force_compact=True)` 没有旧交互时继续收缩工具证据预览，以原请求估算的 68% 和窗口阈值的 68% 中较小者作为收缩目标；保留全文引用、配对 ID 和正式目标，重新估算后仍超出模型单次输入空间则明确报告失败。Harness 消费排队请求后清除标志。
 - 用量同时保存当前 task 与累计 session 的实际使用量；模型、工具和压缩记录带当前正式 `task_id`。`UsageTracker.check_budget()` 保留既有调用参数并返回真实统计，累计输入、输出、模型次数与工具次数不拒绝执行。`max_input_tokens=500000` 用于压缩周期，其余历史累计配置字段保留作统计参考。摘要和恢复均不重置已用量；任务累计活动时间与运行尝试次数同样只记录。
 - history 是 OpenAI 格式消息列表；切分保留 tool_calls 与对应结果完整配对。正式 task/state 的发送视图始终重新注入，压缩历史摘要不覆盖正式记录。
 - STATE 视图选取最早五项、最近十五项 facts 以及最近十项 hypotheses，其他程序字段完整保留。TASK 的 `acceptance.file_identities` 超过二十四项时选取最早八项及 `repair_progress.files_read` 中已有路径；其他任务与验收字段完整保留。视图附 `context_selection` 数量与全文引用；全文保存于会话 `tool-output/STATE-<task_id>.json` 和 `TASK-<task_id>.json`。选择范围不调用模型或产生压缩记录，Checkpoint 仍保存完整输入 task/state；全部身份约束继续交给独立 Verifier 核对。
@@ -37,6 +37,7 @@
 
 - `ExampleCatalog(project_root).list_examples() -> list[dict]`：`benchmark_path,name,readme_path,inventory_entry`。
 - `InstanceManager(settings,store,events)`：`create(benchmark_path,name=None) -> dict`；`list_instances()`；`get(instance_id)`；`check_changes(instance_id)`；记录 `code_root,benchmark_path,readme_path,environment,status,verification`。
+- `check_changes()` 的包清单检查与 Verifier 共用 `runtime_environment()`，清除控制进程的 `PYTHONPATH/PYTHONHOME` 后使用实例解释器，按正式包名称和版本核对环境变化。
 - `EnvironmentManager(settings,store,events)`；`async prepare(instance,install=True,plan_id=None) -> dict`；实例独立 venv，解释器实际完整路径，原有准备脚本按声明执行。`preview_prepare(instance)` 生成稳定准备计划，`revalidate(instance,plan_id)` 核查实例、环境代次和输入文件版本。
 - `async inspect(instance,requirements_files=None,modules=None)` 保存真实解释器、包版本、pip check、模块导入及依赖文件版本。`async plan_install(instance,requirements_files=None,packages=None,constraints_files=None,index_url=None,timeout=1800,modules=None)` 保存安装输入、计划与审批依据；`async install(instance,plan_id)` 创建候选环境，执行安装及检查后激活，返回 `postcheck`。`recover(instance)` 核查所属进程和中断记录，`async cancel(instance=None)` 终止所属操作。
 - `EnvironmentCommands(settings,store,events)`；`preview(instance,argv,cwd=".",timeout=300,writable_directories=None,network=False)` 返回具体审批内容；`async execute(...,approved=None)` 核查审批内容并执行，保存独立命令记录。源码和现有环境只读，生成目录及网络权限显式审批。
@@ -46,6 +47,7 @@
 - Environment 保存 `summary,warnings,preparation_scope,steps,failed_step`。准备步骤发送 `environment.step_started/completed/failed`，失败保留 `error_tail,log_ref`；复用环境补充说明时保持已有验证判定。
 - `Runner(settings,store,events)`；`async run(instance,overrides=None) -> dict`；`async cancel()`；`get_run(instance_id,run_id)`；绑定独立 cwd/解释器/workspace，事件通道区别于 stdout/stderr。
 - 若子进程在采集创建时间之前已结束，`process_created_at` 保持 null，继续读取真实退出码和 stdout/stderr；恢复时不把缺少身份的 PID 判为所属活动进程。
+- 新 Run 启动前若仍缓存重启前的所属进程，重新核查 PID、创建时间与所属身份；存活时保持运行互斥，已退出时将旧 Run 保存为 interrupted、退出码保持未知，允许启动新 Run。
 - Run 保存 `run_id,instance_id,environment_id,status,exit_code,timed_out,interrupted,started_at,completed_at,command,cwd,output_dir,stdout_ref,stderr_ref,events,testcases,metrics,artifacts,config_snapshot`，未知字段为 null。`execution_configuration` 保存入口和实际启动环境中的 `mock_runtime_enabled,pythonpath_override`，来源类型为 `runner_launch_environment`；该字段说明启动配置，模型正确性仍由执行与独立检查证据判断。
 - `Verifier(settings,store,events)`；`async verify(instance,run,acceptance=None) -> dict`；`async validate(instance) -> dict`。判定 `passed,execution_completed,results_complete,checks_passed,goal_achieved,repair_completed,checks,reasons,evidence_type`；必需检查 SKIP、旧 CSV、缺失本轮指标不能通过。
 - `validate()` 的检查附 `source_kind=static_validation` 及本次 `report.json` 引用；通过该来源明确区分静态检查材料与实际 Run。验证条件保持独立。
@@ -60,6 +62,7 @@
 - 已结束的独立 Run 开始新修复时，创建新的 task_id，采用用户修复目标并继承原验收。进行中的修复保留原目标、验收及用量。`run_current()` 保存本次独立运行的结束状态；工具 `run_example` 仍允许循环依据新的失败继续修复。
 - 每轮工具结束后，Harness 从正式工具记录更新 `state.repair_progress`：`phase,tool_rounds,rounds_without_change,files_read,recent_actions,last_run_id,updated_at`。已读文件保留版本、范围、截断状态及证据引用，存在冻结身份时附比较结果。Observe 仅添加或修正事实与假设，不能覆盖该程序记录。
 - 文件工具使用 UTF-8/BOM 编码识别与严格解码；`read_file.ends_with_newline` 表示完整文件的末尾换行状态，分页时保持相同。搜索保留明确范围、编码、跳过原因及分页信息，`limit` 与 Schema 同为 1～1000。读取错误保持失败。`read_evidence` 开放当前实例正式登记的验证、环境计划、检查、操作、pip 报告和执行日志，以及允许的会话证据引用。
+- `read_file` 对目录及其他非普通文件返回统一工具错误，保存 `tools.jsonl` 与 `tool.failed`，模型可以继续选择工具；缺失文件保留 `file_version=absent`，供新文件补丁绑定来源。
 - `apply_patch` 工具只接受 `patch`；程序从当前实例、会话和任务的正式 `read_file` 结果绑定文件版本及证据引用。新文件需先读取并确认不存在。审批前后核对绑定版本，GNU patch 在 Bubblewrap 的 staging 目录先预检再应用；统一 CRLF 文件使用标准文本 I/O 转换 staging 换行，提交时保留原换行样式与末尾状态。原始 `input.diff` 全文与 GNU 使用的 LF 副本 `execution.diff` 分别保存，两次操作和变更记录包含 `execution_input_ref`，副本只读挂载。提交前再次读取原始字节核对版本，完整检查通过后更新实例文件与验证状态。
 - Harness 结束任务保存 `state.result`，包含完整事实、假设、下一步、验证状态及可读正文；诊断结果通过 `agent.message(role=result)` 与终止事件发送。只读对话的最终回复保持一次展示。
 - TUI 位于 `ianvs_agent.app.tui`，`run_app(settings,harness=None)` 为启动函数；只消费 events 或读取 Harness 数据；后台任务使用 Textual Worker。

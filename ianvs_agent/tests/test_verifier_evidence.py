@@ -119,7 +119,15 @@ class RealRunVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(identity, package_identity(packages[:-1]))
         self.assertNotEqual(identity, package_identity([*packages, packages[0]]))
         harness = AgentHarness(self.settings)
-        unchanged = await asyncio.to_thread(harness.instances.check_changes, self.instance["instance_id"], False)
+        previous_pythonpath = os.environ.get("PYTHONPATH")
+        os.environ["PYTHONPATH"] = "."
+        try:
+            unchanged = await asyncio.to_thread(harness.instances.check_changes, self.instance["instance_id"], False)
+        finally:
+            if previous_pythonpath is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = previous_pythonpath
         self.assertFalse(unchanged["environment_changed"])
         self.assertFalse(unchanged["needs_verification"])
         self.assertFalse(unchanged["verification"]["stale"])

@@ -233,9 +233,11 @@ class ContextManager:
                 messages = await self._offload(self._assemble, task, state, available_history, checkpoint, role)
                 estimated = await self._offload(self.estimator.request, messages, selected_tools)
             elif force_compact:
-                raise BudgetExceededError("近期完整交互尚不足以压缩；已有任务与原始历史保持保存")
-        if estimated > available or (role == "plan" and (estimated >= threshold or (checkpoint and estimated > threshold * 0.7))):
+                await self._offload(self.events.emit, "context.compaction_skipped", {"reason": "no_older_history", "trigger": "context_limit_recovery", "message": "当前没有较早完整历史可压缩，继续缩减已保存的工具证据发送范围"})
+        if estimated > available or (role == "plan" and (force_compact or estimated >= threshold or (checkpoint and estimated > threshold * 0.7))):
             target = int(threshold * 0.68) if role == "plan" else available
+            if role == "plan" and force_compact:
+                target = min(target, int(estimated * 0.68))
             messages = await self._offload(self._bound_tool_evidence, messages, selected_tools, target, 240 if force_compact else 1200)
             estimated = await self._offload(self.estimator.request, messages, selected_tools)
         if estimated > available:
@@ -298,7 +300,7 @@ class ContextManager:
         fingerprint = message_fingerprint(request_history(history))
         previous_id = previous["checkpoint_id"] if previous else None
         checked_checkpoint = (previous_record.get("checkpoint_id") or previous_record.get("previous_checkpoint_id")) if previous_record else None
-        if previous_record and previous_record.get("history_fingerprint") == fingerprint and checked_checkpoint == previous_id and previous_record.get("input_limit") == limit and (previous_record.get("status") in {"attempted", "completed"} or previous_record.get("used_input_tokens") == used):
+        if previous_record and previous_record.get("history_fingerprint") == fingerprint and checked_checkpoint == previous_id and previous_record.get("input_limit") == limit and (previous_record.get("status") in {"attempted", "completed", "deferred"} or previous_record.get("used_input_tokens") == used):
             return {"status": "not_needed", "reason": "already_checked"}
         base = self._compaction_budget_base(task, previous)
         period = used - base
@@ -355,7 +357,23 @@ class ContextManager:
         await self._offload(self.store.write, path, record)
         await self._offload(self.events.emit, "context.preparing", {"role": "compaction", "manual": False, "trigger": "task_input_budget", **record})
         event_range = await self._offload(self._compaction_event_range)
-        response = await self.provider.complete(plan["messages"], [], purpose="compaction", max_attempts=1)
+        try:
+            response = await self.provider.complete(plan["messages"], [], purpose="compaction", max_attempts=1)
+        except Exception as error:
+            failure = getattr(error, "request_failure", {}) or {}
+            if failure.get("retryable") is not True or failure.get("purpose") != "compaction" or prepared["estimated_tokens"] > self._input_budget():
+                raise
+            totals = await self._offload(self.provider.usage.summary)
+            record.update({
+                "status": "deferred", "reason": "retryable_request_failed",
+                "message": "累计输入周期压缩遇到可恢复的网络失败；失败与用量已保存，继续发送窗口内已准备的请求",
+                "used_input_tokens": totals["task_effective_input_tokens"],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "request_failure": {key: failure.get(key) for key in ("request_group_id", "purpose", "error_type", "failure_stage", "duration_seconds", "chunk_count", "attempt_ref", "retryable")},
+            })
+            await self._offload(self.store.write, path, record)
+            await self._offload(self.events.emit, "context.compaction_deferred", record)
+            return prepared
         summary = self._summary(response)
         checkpoint = await self._offload(self._save_checkpoint, task, state, history, tools, False, plan["previous"], plan["older"], plan["recent"], event_range, summary, [response], "task_input_budget")
         record.update(status="completed", checkpoint_id=checkpoint["checkpoint_id"])

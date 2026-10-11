@@ -85,6 +85,7 @@ EVENT_LABELS = {
     "context.limit_recovery": "上下文超限，正在压缩并重试",
     "context.compaction_queued": "上下文压缩请求已排队",
     "context.compaction_skipped": "当前无需压缩",
+    "context.compaction_deferred": "周期压缩暂缓，继续任务",
     "run.started": "评测开始执行", "run.stage_changed": "评测阶段更新",
     "run.completed": "评测执行完成", "run.failed": "评测执行失败",
     "run.output": "评测输出", "run.cancelled": "评测已取消",
@@ -548,6 +549,8 @@ class IanvsAgentApp(App):
             self.begin_activity("上下文已准备，等待模型请求" if event_type == "context.prepared" else "上下文超限，正在压缩")
         elif event_type == "context.compacted":
             self.begin_activity("上下文已压缩，正在继续任务")
+        elif event_type == "context.compaction_deferred":
+            self.begin_activity("周期压缩请求失败，已保存证据，继续当前任务")
         elif event_type == "context.compaction_skipped":
             self.notify(payload.get("message") or "近期完整交互不足，无需压缩。", title="上下文")
             if self.harness.state.get("status") == "running":

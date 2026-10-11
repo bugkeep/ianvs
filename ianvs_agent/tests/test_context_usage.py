@@ -356,13 +356,15 @@ class ContextUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(prepared["context_fraction"], self.settings.context_threshold)
         self.assertEqual(self.usage.summary()["model_calls"], 0)
 
-    async def test_context_limit_recovery_without_old_history_remains_explicit(self):
-        with self.assertRaisesRegex(BudgetExceededError, "不足以压缩"):
-            await self.context.prepare({"task_id": "TASK-UNIT"}, {}, [], [], force_compact=True)
+    async def test_context_limit_recovery_without_old_history_keeps_valid_request(self):
+        prepared = await self.context.prepare({"task_id": "TASK-UNIT"}, {}, [], [], force_compact=True)
+        self.assertLessEqual(prepared["estimated_tokens"], self.context._input_budget())
         with self.assertRaisesRegex(BudgetExceededError, "不足以压缩"):
             await self.context.compact({"task_id": "TASK-UNIT"}, {}, [], [], manual=False)
         self.assertEqual(self.usage.summary()["model_calls"], 0)
-        self.assertFalse(any(event["event_type"] == "context.compaction_skipped" for event in self.store.read_events("events.jsonl")))
+        skipped = [event for event in self.store.read_events("events.jsonl") if event["event_type"] == "context.compaction_skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["payload"]["trigger"], "context_limit_recovery")
 
     async def test_manual_compaction_without_old_history_returns_visible_skip(self):
         task = {"task_id": "TASK-UNIT", "goal": "保留原任务和验收条件"}
