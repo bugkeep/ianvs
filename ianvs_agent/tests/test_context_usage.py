@@ -296,7 +296,8 @@ class ContextUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已登记配置证据", text)
         self.assertIn('"stale": true', prepared["messages"][2]["content"])
         self.assertIn(goal, prepared["messages"][-1]["content"])
-        self.assertIn("用户明确要求不调用工具时直接答复", prepared["messages"][-1]["content"])
+        self.assertIn("在本次响应声明完整成果", prepared["messages"][-1]["content"])
+        self.assertIn("纯问答可在声明调用中提供 answer_text", prepared["messages"][-1]["content"])
         self.assertNotIn(state["next_goal"], prepared["messages"][-1]["content"])
         self.assertNotIn("继续安排下一组工具调用", prepared["messages"][-1]["content"])
         self.assertIn("original_run", prepared["messages"][1]["content"])
@@ -305,7 +306,8 @@ class ContextUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.usage.summary()["model_calls"], 0)
 
     async def test_observe_budget_preserves_tool_pair_and_full_evidence(self):
-        self.settings.context_input_budget = 3000
+        # Leave room for fixed task/contract rules while forcing the large result to an excerpt.
+        self.settings.context_input_budget = 4096
         content = "当前工具读取的真实文件文字及配置版本\n" * 5000
         source = self.root / "large-evidence.txt"
         source.write_text(content, encoding="utf-8")
@@ -316,10 +318,11 @@ class ContextUsageTests(unittest.IsolatedAsyncioTestCase):
         ]
         task = {"goal": "保留原始目标", "acceptance": {"required_metrics": ["accuracy"]}}
         prepared = await self.context.prepare(task, {"verification": {"passed": False}}, history, [], role="observe")
-        self.assertLessEqual(prepared["estimated_tokens"], 3000)
+        self.assertLessEqual(prepared["estimated_tokens"], self.settings.context_input_budget)
         current = prepared["messages"][-3:-1]
         complete_interactions(current)
         excerpt = json.loads(current[-1]["content"])
+        self.assertLess(len(current[-1]["content"]), len(history[-1]["content"]))
         saved = self.store.read(excerpt["full_output_ref"])
         self.assertEqual(saved, tool_result)
         self.assertEqual(json.loads(history[-1]["content"]), tool_result)

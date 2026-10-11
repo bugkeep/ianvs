@@ -116,10 +116,14 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.harness.task, original)
         self.assertEqual(self.harness.usage_summary(), usage)
         self.assertEqual(self.harness.usage_summary()["tool_calls"], 1)
-        with self.assertRaisesRegex(RuntimeError, "环境尚未准备"):
+        credential_name = "IANVS_F2_REPAIR_TEST_KEY_" + uuid.uuid4().hex
+        self.harness.settings.profile.api_key_env = credential_name
+        with self.assertRaisesRegex(ValueError, "缺少模型凭据环境变量 " + credential_name):
             await self.harness.run_current()
         self.assertEqual(self.harness.task, original)
         self.assertEqual(self.harness.task["goal"], goal)
+        self.assertIsNone(self.harness.current_instance.get("last_run_id"))
+        self.assertFalse(self.harness.state["completion_progress"]["ready"])
         self.assertEqual(self.harness.usage_summary()["model_calls"], 0)
 
     @unittest.skipUnless(os.environ.get("IANVS_HARNESS_COMPLETED_RUN_CAPTURE"), "需要已归档的真实 completed Run 任务与状态")
@@ -222,7 +226,8 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.harness._requires_observation([{"name": "read_file"}]))
         prepared = await self.harness.context.prepare(self.harness.task, self.harness.state, self.harness.history(), self.harness.tools.definitions())
         self.assertIn(goal, prepared["messages"][-1]["content"])
-        self.assertIn("安装并检查结果", prepared["messages"][-1]["content"])
+        self.assertFalse(self.harness.completion.evaluate()["ready"])
+        self.assertIn("declare_completion_contract", [item["function"]["name"] for item in prepared["tools"]])
         self.assertNotIn("不要自动检查环境", prepared["messages"][-1]["content"])
         self.assertIn("只读诊断和向用户说明发现无需修改审批", self.harness.context._system("observe"))
         self.assertIn("每项使用 value", self.harness.context._system("observe"))
@@ -322,7 +327,7 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.harness.provider.client)
 
     @unittest.skipUnless(os.environ.get("IANVS_HARNESS_VERIFIED_RESUME_CAPTURE") and os.environ.get("IANVS_HARNESS_RESUME_ARCHIVE"), "需要真实复验通过的状态目录与原阻塞会话归档")
-    async def test_verified_repair_resume_finishes_without_another_model_request(self):
+    async def test_verified_legacy_repair_resume_still_requires_completion_contract(self):
         source = Path(os.environ["IANVS_HARNESS_VERIFIED_RESUME_CAPTURE"])
         archive = Path(os.environ["IANVS_HARNESS_RESUME_ARCHIVE"])
         archived = {name: (archive / name).read_bytes() for name in ("session_snapshot.json", "task.json", "state.json", "history.json", "events.jsonl", "usage.jsonl")}
@@ -369,8 +374,13 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
         self.harness.settings.max_task_seconds = max(0.000001, self.harness.state["active_execution_seconds"] / 2)
         events = self.harness.store.read_events(self.harness.session_relative_path + "/events.jsonl")
         llm_started = sum(event["event_type"] == "llm.started" for event in events)
-        result = await self.harness.resume_current()
-        self.assertEqual(result["status"], "completed")
+        credential_name = "IANVS_LEGACY_COMPLETION_TEST_KEY_" + uuid.uuid4().hex
+        self.harness.settings.profile.api_key_env = credential_name
+        with self.assertRaisesRegex(ValueError, "缺少模型凭据环境变量 " + credential_name):
+            await self.harness.resume_current()
+        self.assertEqual(self.harness.state["status"], "failed")
+        self.assertFalse(self.harness.state["completion_progress"]["ready"])
+        self.assertIn("完整成果清单", self.harness.state["completion_progress"]["missing"][0])
         self.assertEqual(self.harness.task, task)
         self.assertEqual(self.harness.state.get("facts"), facts)
         self.assertEqual(self.harness.state["resume_count"], state.get("resume_count", 0) + 1)
@@ -380,11 +390,11 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((isolated / relative / "usage.jsonl").read_bytes(), archived["usage.jsonl"])
         events = self.harness.store.read_events(self.harness.session_relative_path + "/events.jsonl")
         self.assertEqual(sum(event["event_type"] == "llm.started" for event in events), llm_started)
-        self.assertEqual(events[-1]["event_type"], "agent.completed")
+        self.assertEqual(events[-1]["event_type"], "agent.failed")
         self.assertEqual(self.harness.settings.max_input_tokens, 1)
         self.assertIsNone(self.harness.provider.client)
         self.assertTrue(all((archive / name).read_bytes() == content for name, content in archived.items()))
-        self.harness.store.write("verified-resume-test-source.json", {"source_state": str(source), "source_archive": str(archive), "task_id": task["task_id"], "run_id": run_id, "original_status": state["status"], "final_status": result["status"], "verified_at": verification.get("verified_at"), "original_active_execution_seconds": state["active_execution_seconds"], "final_active_execution_seconds": self.harness.state["active_execution_seconds"], "model_calls_added": 0, "usage_preserved": True, "max_input_tokens": settings.max_input_tokens})
+        self.harness.store.write("verified-resume-test-source.json", {"source_state": str(source), "source_archive": str(archive), "task_id": task["task_id"], "run_id": run_id, "original_status": state["status"], "final_status": self.harness.state["status"], "verified_at": verification.get("verified_at"), "original_active_execution_seconds": state["active_execution_seconds"], "final_active_execution_seconds": self.harness.state["active_execution_seconds"], "model_calls_added": 0, "usage_preserved": True, "completion_contract_required": True, "max_input_tokens": settings.max_input_tokens})
 
     async def test_failed_install_plan_requires_real_completion_evidence(self):
         self.harness._ensure_task("安装当前 Example 的声明依赖并检查")
@@ -395,7 +405,7 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
         self.harness._update_task_progress([result])
         self.assertEqual(self.harness.task["kind"], "maintenance")
         self.assertEqual(self.harness.task["goal"], goal)
-        self.assertTrue(self.harness.state["maintenance_progress"]["install_pending"])
+        self.assertFalse(self.harness.state["maintenance_progress"]["install_pending"])
         self.assertFalse(self.harness._maintenance_is_complete())
         self.assertEqual(self.harness.usage_summary()["model_calls"], 0)
 
@@ -505,7 +515,8 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.harness.current_instance["environment"]["status"], "modified")
         checked = await self.harness.tools.execute({"id": "modified-environment-check", "name": "inspect_environment", "arguments": {"requirements_files": [path], "modules": ["json"]}})
         self.assertEqual(checked["status"], "success", checked.get("error"))
-        self.assertTrue(checked["data"]["passed"])
+        self.assertFalse(checked["data"]["passed"])
+        self.assertFalse(self.harness.store.read(checked["data"]["evidence_ref"])["readiness"]["passed"])
         self.harness._update_task_progress([checked])
         self.assertEqual(self.harness.current_instance["environment"]["status"], "modified")
         self.assertFalse(self.harness._maintenance_is_complete())
@@ -523,17 +534,24 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
         usage_bytes = usage_path.read_bytes()
         check_ref = self.harness.state["maintenance_progress"]["environment_check"]["evidence_ref"]
         check_bytes = self.harness.store.path(check_ref).read_bytes()
-        result = await self.harness._action(self.harness._loop(), task_budget=True)
-        self.assertEqual(result["status"], "completed")
+        credential_name = "IANVS_LEGACY_MAINTENANCE_TEST_KEY_" + uuid.uuid4().hex
+        self.harness.settings.profile.api_key_env = credential_name
+        with self.assertRaisesRegex(ValueError, "缺少模型凭据环境变量 " + credential_name):
+            await self.harness._action(self.harness._loop(), task_budget=True)
+        self.assertEqual(self.harness.state["status"], "failed")
+        self.assertFalse(self.harness.completion.contract())
+        self.assertFalse(self.harness.state["completion_progress"]["ready"])
         self.assertEqual(self.harness.task, task)
         self.assertEqual(self.harness.state["maintenance_progress"]["phase"], "completed")
         self.assertTrue(self.harness._maintenance_is_complete())
         self.assertFalse(self.harness._repair_is_complete())
-        self.assertEqual(self.harness.usage_summary(), usage)
+        # Preparing the declaration request updates context estimates without consuming tokens.
+        actual_usage = self.harness.usage_summary()
+        self.assertEqual({key: value for key, value in actual_usage.items() if not key.startswith("context_")}, {key: value for key, value in usage.items() if not key.startswith("context_")})
         self.assertEqual(usage_path.read_bytes(), usage_bytes)
         self.assertEqual(self.harness.store.path(check_ref).read_bytes(), check_bytes)
         events = self.harness.store.read_events(self.harness.session_relative_path + "/events.jsonl")
-        self.assertEqual(events[-1]["event_type"], "agent.completed")
+        self.assertFalse(any(event["event_type"] == "agent.completed" for event in events))
         self.assertFalse(any(event["event_type"] == "llm.started" for event in events))
         self.assertEqual(self.harness.usage_summary()["model_calls"], 0)
         self.assertIsNone(self.harness.provider.client)

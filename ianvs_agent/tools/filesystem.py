@@ -209,11 +209,22 @@ class CodeTools:
         if target.parent == self.harness.store.path(base + "original-goals"):
             OriginalGoalStore(self.harness.settings, self.harness.store).load(self.instance, relative)
             original_goal = True
+        original_object = None
+        if relative.startswith("original-goals/objects/"):
+            target, original_object = OriginalGoalStore(self.harness.settings, self.harness.store).bound_object(self.instance, reference, self.harness.task.get("original_goal"))
+        completion_evidence = False
+        completion_prefix = self.harness.session_relative_path + f"/completion/{self.harness.task.get('task_id')}/"
+        if relative.startswith(completion_prefix):
+            contract = self.harness.completion.contract()
+            completion_evidence = bool(contract and reference == contract["evidence_ref"] and contract["task_id"] == self.harness.task.get("task_id") and contract["instance_id"] == self.instance["instance_id"] and target.parent == self.harness.store.path(completion_prefix))
         environment_log = False
         if relative.startswith("environments/") and len(Path(relative).parts) >= 3:
             environment_id = Path(relative).parts[1]
             environment = self.harness.store.read(f"environments/{environment_id}/environment.json", {})
             environment_log = environment.get("instance_id") == self.instance["instance_id"] and (target.suffix == ".log" or relative == environment.get("pip_report_ref"))
+            if environment.get("instance_id") == self.instance["instance_id"] and relative == environment.get("readiness_ref"):
+                self.harness.environment._readiness_scope(environment)
+                environment_log = True
         operation_evidence = False
         for kind, filename in (("environment-plans", None), ("environment-checks", "check.json"), ("environment-commands", "command.json")):
             if not relative.startswith(base + kind + "/"):
@@ -228,14 +239,22 @@ class CodeTools:
                 if record.get(name):
                     references.add(self.harness.store.read(record[name], {}).get("log_ref"))
             operation_evidence = record.get("instance_id") == self.instance["instance_id"] and (relative in references or str(target) in references)
-        if not relative.startswith(permitted) and not original_goal and not environment_log and not operation_evidence and not self._registered_validation_report(relative):
-            raise PermissionError("只能读取当前实例已登记的原目标、运行、工具、验证报告或环境日志证据")
+        if not relative.startswith(permitted) and not original_goal and not original_object and not completion_evidence and not environment_log and not operation_evidence and not self._registered_validation_report(relative):
+            raise PermissionError("只能读取当前实例已登记的原目标、运行、工具、验证报告或环境证据。reference 使用返回的完整路径，或相对 state_root 的引用，例如 environments/<environment_id>/core-install.log；不要额外添加 state/ 前缀")
         if not target.is_file():
             raise PermissionError("证据引用必须指向已经保存的普通文件")
         if start_line < 1 or end_line < start_line or end_line - start_line > 2000:
             raise ValueError("证据读取范围无效")
-        lines = target.read_text(encoding="utf-8").splitlines()
-        return {"reference": relative, "start_line": start_line, "end_line": min(end_line, len(lines)), "total_lines": len(lines), "content": "\n".join(f"{index + 1}: {lines[index]}" for index in range(start_line - 1, min(end_line, len(lines)))), "truncated": end_line < len(lines), "next_line": end_line + 1}
+        if original_object:
+            content, text, encoding, reason = self._source_text(target)
+            if hashlib.sha256(content).hexdigest() != original_object["file_version"]:
+                raise ValueError("原目标来源对象与创建时文件摘要不同")
+            if reason:
+                raise ValueError(f"无法作为文本读取 {original_object['path']}：{reason}；支持 UTF-8 及带 BOM 的 UTF-16/UTF-32")
+        else:
+            text, encoding = target.read_text(encoding="utf-8"), "utf-8"
+        lines = text.splitlines()
+        return {"reference": relative, "start_line": start_line, "end_line": min(end_line, len(lines)), "total_lines": len(lines), "content": "\n".join(f"{index + 1}: {lines[index]}" for index in range(start_line - 1, min(end_line, len(lines)))), "truncated": end_line < len(lines), "next_line": end_line + 1, **({**original_object, "encoding": encoding} if original_object else {})}
 
     def _instance_summary(self, instance):
         output_id = self.harness.store.allocate_id("OUTPUT")
@@ -247,6 +266,8 @@ class CodeTools:
         summary["original_goal"] = goal_summary(self.harness.store.read(goal_reference) if goal_reference else None)
         environment = instance.get("environment") or {}
         summary["environment"] = environment_summary(environment)
+        if instance.get("last_environment_attempt"):
+            summary["last_environment_attempt"] = instance["last_environment_attempt"]
         summary["runtime_credentials"] = credential_status(self.harness.settings, instance)
         summary["allowed_runtime_credentials"] = sorted(self.harness.settings.runtime_credentials)
         verification = instance.get("verification") or {}
@@ -441,7 +462,7 @@ def register_tools(harness, registry):
     integer = {"type": "integer"}
     registry.register("read_file", "读取当前实例源码和配置，支持 UTF-8 及带 BOM 的 UTF-16/UTF-32，正式记录行号、内容与版本供补丁审批使用；不存在的路径返回 exists=false、file_version=absent，作为新文件的创建依据", {"path": string, "start_line": integer, "end_line": integer}, ["path"], code.read_file)
     registry.register("search_text", "按 Python 正则逐行搜索当前实例文本；paths 默认为 examples、core，可指定源码相对路径。返回文件路径、行号、分页位置、搜索范围和跳过原因；支持 UTF-8 及带 BOM 的 UTF-16/UTF-32，不跟随符号链接；limit 1..1000，默认 50", {"pattern": string, "paths": {"type": "array", "items": string, "minItems": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": SEARCH_MAX_LIMIT, "default": 50}, "cursor": {"type": "integer", "minimum": 0, "default": 0}}, ["pattern"], code.search_text)
-    registry.register("read_evidence", "读取当前实例已登记的原目标来源、Run、工具全文、独立验证报告或当前环境日志证据；使用工具返回的 evidence_ref/reference/report_ref/static_report_ref", {"reference": string, "start_line": integer, "end_line": integer}, ["reference"], code.read_evidence)
+    registry.register("read_evidence", "读取当前实例已登记的原目标来源、Run、工具全文、独立验证报告、环境日志和原准备范围；逐字使用返回的 evidence_ref/reference/report_ref/static_report_ref/log_ref。可以使用完整路径或相对 state_root 的引用，不额外添加 state/ 前缀", {"reference": string, "start_line": integer, "end_line": integer}, ["reference"], code.read_evidence)
     registry.register("apply_patch", "只提交完整 unified diff，程序自动绑定本任务 read_file 正式读取的版本并审批，执行前检查当前文件；未读取或文件变化时拒绝，创建新文件须先 read_file 确认不存在。使用 --- a/path、+++ b/path 和准确的 @@ 行范围，保留原文上下文并以换行结束", {"patch": string}, ["patch"], code.apply_patch, modifies=True, approval_context=code.patch_approval)
     registry.register("bash", "在实例源码目录运行只读调查命令，支持 pwd、ls、stat；文本搜索使用 search_text", {"command": string, "timeout": {"type": "number"}}, ["command"], code.bash)
 

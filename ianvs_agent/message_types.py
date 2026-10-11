@@ -34,13 +34,24 @@ def format_task_result(task, state, status, message, run=None, record_ref=None):
     verification = state.get("verification") or {}
     next_action = state.get("next_goal") or ""
     maintenance = state.get("maintenance_progress") or {}
-    result = {"status": status, "message": message, "facts": facts, "hypotheses": hypotheses, "next_action": next_action, "verification": verification, "maintenance": maintenance, "record_ref": record_ref}
-    if status == "completed" and task.get("kind") == "conversation":
+    completion = state.get("completion_progress") or {}
+    result = {"status": status, "message": message, "facts": facts, "hypotheses": hypotheses, "next_action": next_action, "verification": verification, "maintenance": maintenance, "completion": completion, "record_ref": record_ref}
+    requirements = completion.get("requirements", [])
+    answer_only = bool(requirements) and all(item["kind"] == "answer" for item in requirements)
+    if status == "completed" and task.get("kind") == "conversation" and (answer_only or not requirements):
         result["content"] = message
         return result
     titles = {"completed": "任务处理完成", "blocked": "当前任务阻塞", "failed": "当前操作失败", "cancelled": "任务已取消", "interrupted": "上次任务中断"}
     lines = [titles.get(status, "任务状态") + "。"]
-    if task.get("kind") == "maintenance":
+    if requirements:
+        lines.append("任务要求与证据：")
+        for item in requirements:
+            label = "已验证" if item["status"] == "passed" else "待完成"
+            evidence = item.get("evidence")
+            lines.append(f"- {label}：{item['description']}" + ("\n  证据：" + (evidence if isinstance(evidence, str) else json.dumps(evidence, ensure_ascii=False)) if evidence else "；尚缺少本任务当前版本的正式检查记录"))
+    elif completion.get("missing"):
+        lines.append("待完成：" + "；".join(completion["missing"]))
+    if task.get("kind") == "maintenance" and not requirements:
         receipt = maintenance.get("environment_check") or {}
         lines.append("环境检查：" + ("已通过，本任务的安装与运维证据已保存。" if maintenance.get("phase") == "completed" else "尚未取得修改后的完整检查结果。"))
         if receipt.get("evidence_ref"):
@@ -64,8 +75,12 @@ def format_task_result(task, state, status, message, run=None, record_ref=None):
         lines.append("处理结果：" + message)
     if next_action:
         lines.append("下一步：" + next_action)
-    passed = verification.get("passed") is True and not verification.get("stale")
-    lines.append("原始评测独立验证：" + ("通过。" if passed else "尚未通过；当前不能宣称修复完成。"))
+    benchmarks = [item for item in requirements if item["kind"] == "benchmark"]
+    if not requirements or benchmarks:
+        passed = all(item["status"] == "passed" and item.get("evidence") for item in benchmarks) if benchmarks else verification.get("passed") is True and not verification.get("stale")
+        lines.append("原始评测独立验证：" + ("通过。" if passed else "尚未通过；当前不能宣称修复完成。"))
+        if benchmarks and not passed and verification.get("passed") is True and verification.get("run_id"):
+            lines.append(f"历史运行 {verification['run_id']} 曾通过独立验证；当前任务要求仍需取得对应的正式验证证据。")
     if record_ref:
         lines.append("完整诊断记录：" + record_ref)
     result["content"] = "\n\n".join(lines)

@@ -55,6 +55,8 @@ class ToolRegistry:
                 return await self.harness._run_sync(self._failure, call, "未登记的工具", started)
             item = self.tools[name]
             Draft202012Validator(item["schema"]).validate(arguments)
+            if self.harness.state.get("status") == "running" and not self.is_read_only(name, arguments):
+                await self.harness._run_sync(self.harness.completion.ensure_action_allowed)
             resolved = None
             if not self.is_read_only(name, arguments):
                 resolved = await self._resolved_approval(item, arguments)
@@ -77,7 +79,7 @@ class ToolRegistry:
         except (ValidationError, PermissionError, FileNotFoundError, ValueError, RuntimeError, TimeoutError, re.error) as error:
             return await self.harness._run_sync(self._failure, call, str(error), started)
         elapsed = time.monotonic() - started
-        record = {"operation_id": operation_id, "call_id": call["id"], "name": name, "arguments": arguments, "status": "success", "data": result, "error": None, "duration_seconds": elapsed}
+        record = {"operation_id": operation_id, "call_id": call["id"], "task_id": self.harness.task.get("task_id"), "name": name, "arguments": arguments, "status": "success", "data": result, "error": None, "duration_seconds": elapsed}
         if call.get("approval_context") is not None:
             record["approval_context"] = call["approval_context"]
         return await self.harness._run_sync(self._complete, record)

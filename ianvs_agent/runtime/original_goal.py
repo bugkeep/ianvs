@@ -9,12 +9,37 @@ import math
 import os
 import re
 import uuid
+from importlib.machinery import BYTECODE_SUFFIXES, EXTENSION_SUFFIXES
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import yaml
 from filelock import FileLock
 
 from .instances import utc_now, validate_identity
+
+
+def python_module_candidates(declared, manifest):
+    if not isinstance(declared, str) or not declared or any(not part.isidentifier() for part in declared.split(".")):
+        return [], []
+    parts = declared.split(".")
+    chain = []
+    for index in range(1, len(parts) + 1):
+        path = "/".join(parts[:index])
+        if any(path + suffix in manifest or path + "/__init__" + suffix in manifest for suffix in EXTENSION_SUFFIXES + BYTECODE_SUFFIXES):
+            return [], chain
+    for index in range(1, len(parts)):
+        parent = "/".join(parts[:index])
+        package = parent + "/__init__.py"
+        if package in manifest:
+            chain.append({"kind": "package", "path": package})
+        elif parent + ".py" in manifest:
+            return [], chain
+        elif any(name.startswith(parent + "/") for name in manifest):
+            chain.append({"kind": "namespace", "path": parent})
+        else:
+            return [], chain
+    name = "/".join(parts)
+    return [candidate for candidate in (name + ".py", name + "/__init__.py") if candidate in manifest], chain
 
 
 class OriginalGoalStore:
@@ -179,10 +204,13 @@ class OriginalGoalStore:
         path = Path(os.path.abspath(root / declared))
         return path.relative_to(root).as_posix() if path.is_relative_to(root) else None
 
-    def _candidates(self, instance, declared, marker, manifest):
+    def _candidates(self, instance, declared, marker, manifest, *, python_module=False):
         direct = self._local_reference(instance, declared)
         if direct in manifest:
             return [direct], "original_reference"
+        if python_module and isinstance(declared, str) and declared and all(part.isidentifier() for part in declared.split(".")):
+            candidates, _ = python_module_candidates(declared, manifest)
+            return candidates, "python_module_reference"
         if not marker or not isinstance(declared, str) or "://" in declared:
             return [], "original_reference"
         parts = PurePosixPath(declared.replace("\\", "/")).parts
@@ -258,8 +286,8 @@ class OriginalGoalStore:
             return all(cls._json_value(item) for item in value)
         return isinstance(value, dict) and all(isinstance(key, str) and cls._json_value(item) for key, item in value.items())
 
-    def _bind(self, instance, declared, field, marker, manifest, objects, bindings, unresolved, *, document=False):
-        candidates, basis = self._candidates(instance, declared, marker, manifest)
+    def _bind(self, instance, declared, field, marker, manifest, objects, bindings, unresolved, *, document=False, python_module=False):
+        candidates, basis = self._candidates(instance, declared, marker, manifest, python_module=python_module)
         if len(candidates) != 1:
             unresolved.append({"field": field, "declared": declared, "reason": "ambiguous_reference" if candidates else "creation_source_missing", "candidates": candidates})
             return None
@@ -269,6 +297,8 @@ class OriginalGoalStore:
             unresolved.append({"field": field, "declared": declared, "path": name, "reason": "creation_bytes_unavailable", "expected_sha256": manifest[name]})
             return None
         item = {"field": field, "declared": declared, "path": name, "binding_basis": basis, **original}
+        if basis == "python_module_reference":
+            _, item["python_module_chain"] = python_module_candidates(declared, manifest)
         bindings.append(copy.deepcopy(item))
         if document:
             data = self._object(item["sha256"], item["object_ref"]).read_bytes()
@@ -387,7 +417,7 @@ class OriginalGoalStore:
                             if not isinstance(module, dict):
                                 unresolved.append({"field": field + "/algorithm/modules", "reason": "unsupported_configuration"})
                             elif module.get("url"):
-                                self._bind(instance, module["url"], f"algorithms/{index}/algorithm/modules/{module_index}/url", "testalgorithms", manifest, objects, bindings, unresolved)
+                                self._bind(instance, module["url"], f"algorithms/{index}/algorithm/modules/{module_index}/url", "testalgorithms", manifest, objects, bindings, unresolved, python_module=True)
         environment = ((testenv or {}).get("document") or {}).get("testenv")
         if not isinstance(environment, dict):
             unresolved.append({"field": "testenv", "reason": "unsupported_configuration"})
@@ -412,6 +442,8 @@ class OriginalGoalStore:
         reasons = {item["reason"] for item in unresolved}
         status = "complete" if not reasons else "needs_binding" if reasons & {"ambiguous_reference", "initial_record_conflict"} else "source_missing" if reasons & {"creation_manifest_missing", "creation_source_missing", "creation_bytes_unavailable"} else "unsupported"
         goal = {"schema_version": 1, "instance_id": instance["instance_id"], "source_manifest_digest": self._digest(manifest), "source_manifest_ref": source_ref, "status": status, "documents": {"benchmark": benchmark, "testenv": testenv, "algorithms": algorithms}, "bindings": bindings, "requirements": {"benchmark": (benchmark or {}).get("document"), "testenv": (testenv or {}).get("document"), "algorithms": [{"name": item["name"], "document": item["document"]} for item in algorithms], "dataset": dataset, "metrics": metrics}, "metric_sources": metric_sources, "artifact_bindings": artifacts, "unresolved": unresolved, "supported_checks": ["creation_file_identity", "configuration_declarations", "metric_source_identity"], "limitations": ["配置来源完整仅证明创建时声明与文件身份；模型加载、数据内容与实际指标仍需本次运行和独立验证证据", "创建清单未包含的模型与数据制品仅保留原声明，不推断其内容身份"]}
+        if any(item["binding_basis"] == "python_module_reference" for item in bindings):
+            goal["limitations"].append("Python 模块声明绑定创建源码候选；实际 import origin 与 namespace 搜索位置仍需运行证据")
         if previous and self._contents(previous) == goal:
             return previous
         identity = self.store.allocate_id("goal")
@@ -451,6 +483,10 @@ class OriginalGoalStore:
                 if item.get("path") not in source["file_objects"] or source["source_manifest"].get(item["path"]) != item.get("sha256"):
                     raise ValueError("原目标绑定没有对应创建来源")
                 self._object(item["sha256"], item["object_ref"])
+                if item.get("binding_basis") == "python_module_reference":
+                    candidates, chain = python_module_candidates(item["declared"], source["source_manifest"])
+                    if candidates != [item["path"]] or chain != item.get("python_module_chain"):
+                        raise ValueError("原目标 Python 模块来源与创建清单不同")
             directories = {(item["field"], item["artifact_directory"]) for item in goal.get("artifact_bindings", []) if item.get("artifact_directory")}
             for field, directory in directories:
                 self._relative(directory)
@@ -469,3 +505,21 @@ class OriginalGoalStore:
         elif goal.get("status") == "complete":
             raise ValueError("完整原目标缺少创建来源清单")
         return goal
+
+    def bound_object(self, instance, reference, original_goal=None):
+        self._relative(reference)
+        if original_goal is not None:
+            if not isinstance(original_goal, dict) or not original_goal.get("evidence_ref"):
+                raise ValueError("任务原目标绑定缺少正式引用")
+            goal = self.load(instance, original_goal["evidence_ref"])
+            if any(original_goal.get(key) != goal.get(key) for key in ("goal_id", "goal_digest", "evidence_ref")):
+                raise ValueError("任务原目标绑定与正式版本不同")
+        else:
+            goal = self.load(instance)
+        binding = next((item for item in (goal or {}).get("bindings", []) if item.get("object_ref") == reference), None)
+        if binding is None:
+            raise PermissionError("只能读取当前任务原目标已绑定的来源对象")
+        if self._manifest(instance).get(binding["path"]) != binding["sha256"]:
+            raise ValueError("原目标来源对象与创建时文件摘要不同")
+        path = self._object(binding["sha256"], reference)
+        return path, {"path": binding["path"], "file_version": binding["sha256"], "object_ref": reference, "source_kind": "creation_snapshot", "original_goal_ref": goal["evidence_ref"]}

@@ -129,7 +129,7 @@ class EnvironmentManager:
             "requirements_files": self._strings(requirements, "requirements_files"),
             "constraints_files": self._strings(existing.get("constraints_files", []) if constraints_files is None else constraints_files, "constraints_files"),
             "packages": self._strings([*retained, *additions], "packages"),
-            "modules": self._strings(modules, "modules"),
+            "modules": self._strings(existing.get("modules", []) if modules is None else modules, "modules"),
             "index_url": index_url or existing.get("index_url"),
         }
         root = Path(instance["code_root"]).resolve()
@@ -148,6 +148,50 @@ class EnvironmentManager:
     @staticmethod
     def _fingerprint(data):
         return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def _record_readiness(self, instance, environment, plan, check):
+        if not check["passed"] or check["request"] != plan["request"]:
+            raise RuntimeError("环境可用范围需要完整的批准计划与通过的执行后检查")
+        reference = f"environments/{environment['environment_id']}/readiness.json"
+        if self.store.path(reference).exists():
+            raise RuntimeError("环境可用范围已登记，不能修改原有检查要求")
+        scope = {
+            "schema_version": 1, "created_at": utc_now(), "evidence_ref": reference,
+            **{key: environment[key] for key in ("instance_id", "environment_id", "generation", "python_executable", "venv_root", "dependency_fingerprint")},
+            "request": copy.deepcopy(check["request"]), "file_versions": dict(check["file_versions"]),
+            "packages": copy.deepcopy(check["packages"]), "interpreter": dict(check["interpreter"]),
+            "postcheck_ref": check["evidence_ref"], "plan_ref": plan["evidence_ref"],
+        }
+        self.store.write(reference, scope)
+        environment.update(readiness_ref=reference, readiness_fingerprint=self._fingerprint(scope))
+
+    def _readiness_scope(self, environment):
+        if not environment or not environment.get("readiness_ref"):
+            return None
+        reference = f"environments/{environment['environment_id']}/readiness.json"
+        scope = self.store.read(reference)
+        if environment["readiness_ref"] != reference or not scope or self._fingerprint(scope) != environment.get("readiness_fingerprint"):
+            raise RuntimeError("环境原始可用范围记录缺失或版本发生变化，需要重新准备环境")
+        return scope
+
+    def _readiness_result(self, instance, environment, scope, check):
+        result = {"scope_ref": scope["evidence_ref"] if scope else None, "passed": False}
+        if scope is None:
+            return {**result, "reason": "缺少可信的原始可用范围，无法通过本次检查恢复环境，请执行受控准备或安装"}
+        identity_fields = ("instance_id", "environment_id", "generation", "python_executable", "venv_root")
+        if scope["instance_id"] != instance["instance_id"] or any(scope[key] != environment.get(key) for key in identity_fields) or scope["interpreter"] != check["interpreter"]:
+            return {**result, "reason": "当前环境代次或解释器身份与原始可用范围不同"}
+        if scope["dependency_fingerprint"] != environment.get("dependency_fingerprint") or scope["dependency_fingerprint"] != self._dependency_fingerprint({**instance, "environment": environment}):
+            return {**result, "reason": "环境依赖声明与原始可用范围不同，需要重新准备环境"}
+        dependencies = check["readiness_dependencies"]
+        if any(dependencies["file_versions"].get(name) != version for name, version in scope["file_versions"].items()):
+            return {**result, "reason": "原始依赖文件版本发生变化，需要重新准备环境"}
+        if package_identity(scope["packages"]) != package_identity(environment.get("packages")) or package_identity(scope["packages"]) != package_identity(check["packages"]):
+            return {**result, "reason": "当前安装包版本与原始可用范围不同，需要重新准备环境"}
+        imports = {item["module"]: item["passed"] for item in check["imports"]}
+        if not dependencies["passed"] or not all(item.get("satisfied", True) for item in dependencies["requirements"]) or not check["pip_check"]["passed"] or not all(imports.get(name) is True for name in scope["request"]["modules"]):
+            return {**result, "reason": "原始依赖要求、pip check 或声明模块检查未通过"}
+        return {**result, "passed": True, "reason": "原始完整检查范围通过，环境代次、声明、包版本与解释器身份保持一致"}
 
     @staticmethod
     def _log_tail(reference):
@@ -183,27 +227,46 @@ class EnvironmentManager:
 
     async def inspect(self, instance, requirements_files=None, modules=None, *, environment=None, request=None):
         environment = environment or instance.get("environment")
-        request = request or self._request(instance, requirements_files=requirements_files, modules=modules)
+        request = copy.deepcopy(request if request is not None else self._request({**instance, "environment": environment}, requirements_files=requirements_files, modules=modules))
         python = (environment or {}).get("python_executable") or self.settings.python_executable
         check_id = self.store.allocate_id("environment-check")
         reference = self._reference(instance, "environment-checks", check_id, "check.json")
         directory = self.store.path(reference).parent
         check = {"schema_version": 1, "check_id": check_id, "instance_id": instance["instance_id"], "task_id": self.events.identities.get("task_id"), "environment_id": (environment or {}).get("environment_id"), "generation": (environment or {}).get("generation", 0), "status": "running", "passed": False, "checked_at": utc_now(), "evidence_ref": reference, "source_kind": "observed_environment", "python_executable": str(python), "request": request}
         self.store.write(reference, check)
+        scope_checked = False
         try:
-            result, operation = await self._worker(instance, python, request, directory)
+            scope = self._readiness_scope(environment)
+            scope_checked = True
+            if scope:
+                check["requested_request"] = copy.deepcopy(request)
+                for key in ("requirements_files", "constraints_files", "packages", "modules"):
+                    request[key] = list(dict.fromkeys([*scope["request"][key], *request.get(key, [])]))
+                self.store.write(reference, check)
+            worker_request = {key: value for key, value in request.items() if key != "_readiness_request"}
+            if scope:
+                worker_request["_readiness_request"] = scope["request"]
+            result, operation = await self._worker(instance, python, worker_request, directory)
             check.update(result)
             check.update(status="completed", checked_at=utc_now(), file_versions=result["dependencies"]["file_versions"], requirements_files=request["requirements_files"], dependency_fingerprint=self._fingerprint({"request": request, "file_versions": result["dependencies"]["file_versions"]}), **{key: operation.get(key) for key in ("command", "cwd", "log_ref", "isolation", "pid", "process_created_at")})
             expected = (environment or {}).get("packages")
             check["package_drift"] = bool(expected is not None and package_identity(expected) != package_identity(result["packages"]))
+            readiness = self._readiness_result(instance, environment, scope, check)
+            check["readiness"] = readiness
+            active = environment is instance.get("environment") and environment is not None
+            if scope and not readiness["passed"]:
+                check["passed"] = False
             if check["package_drift"]:
                 check["passed"] = False
                 check["drift_reason"] = "当前安装包版本与正式环境记录不同"
-                if environment is instance.get("environment"):
+                if active:
                     environment.update(status="modified", observed_packages=result["packages"])
                     self._save(instance, environment)
-            elif not check["passed"] and environment is instance.get("environment") and environment.get("status") == "ready":
+            elif active and environment.get("status") == "ready" and (not readiness["passed"] if scope else not check["passed"]):
                 environment.update(status="modified", check_failure_ref=reference)
+                self._save(instance, environment)
+            elif active and environment.get("status") == "modified" and check["passed"] and readiness["passed"]:
+                environment.update(status="ready", readiness_recovery_ref=reference)
                 self._save(instance, environment)
             if environment:
                 environment["current_check"] = {key: check[key] for key in ("check_id", "passed", "checked_at", "evidence_ref", "environment_id", "generation", "dependency_fingerprint")}
@@ -212,13 +275,13 @@ class EnvironmentManager:
             self.store.write(f"instances/{instance['instance_id']}/instance.json", instance)
             return check
         except (Exception, asyncio.CancelledError) as error:
-            check.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", error=str(error), checked_at=utc_now())
+            check.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", passed=False, error=str(error), checked_at=utc_now())
             operation_reference = (directory / "operation.json").relative_to(self.store.root).as_posix()
             operation = self.store.read(operation_reference, {})
             if operation:
                 check.update(operation_ref=operation_reference, **{key: operation.get(key) for key in ("command", "cwd", "log_ref", "isolation", "phase", "command_executed", "exit_code", "pid", "process_created_at")})
             if environment:
-                if environment is instance.get("environment") and isinstance(error, FileNotFoundError) and not Path(python).is_file():
+                if environment is instance.get("environment") and (not scope_checked or isinstance(error, FileNotFoundError) and not Path(python).is_file()):
                     environment.update(status="modified", check_failure_ref=reference)
                 environment["current_check"] = {key: check.get(key) for key in ("check_id", "passed", "checked_at", "evidence_ref", "environment_id", "generation", "dependency_fingerprint")}
                 self._save(instance, environment)
@@ -553,6 +616,7 @@ class EnvironmentManager:
             await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
             environment.update(status="ready", packages=check["packages"], completed_at=utc_now(), summary="依赖安装与环境检查通过", warnings=[], preparation_scope={"model_data_status": "not_verified"})
             environment["dependency_fingerprint"] = self._dependency_fingerprint({**instance, "environment": environment})
+            self._record_readiness(instance, environment, plan, check)
             environment["candidate"] = False
             self._save(instance, environment)
             plan.update(status="completed", completed_at=utc_now(), postcheck_ref=check["evidence_ref"])
@@ -803,7 +867,7 @@ class EnvironmentManager:
                 package_log = environment_root / "packages.json"
                 await self._run_step(instance, environment, "record_packages", [str(python), "-m", "pip", "--disable-pip-version-check", "list", "--format=json"], root, python, package_log)
                 environment["packages"] = json.loads(package_log.read_text(encoding="utf-8"))
-                check = await self.inspect(instance, environment=environment)
+                check = await self.inspect(instance, environment=environment, request=plan["request"])
                 environment["postcheck"] = check
                 if not check["passed"]:
                     raise RuntimeError("准备后的依赖与模块检查失败，请查看正式环境检查报告")
@@ -813,9 +877,11 @@ class EnvironmentManager:
             environment["completed_at"] = utc_now()
             if plan:
                 await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
-            if environment.get("dependency_spec"):
+            if install and environment.get("dependency_spec"):
                 environment["dependency_spec"]["file_versions"] = environment["postcheck"]["file_versions"]
+            if install:
                 environment["dependency_fingerprint"] = self._dependency_fingerprint({**instance, "environment": environment})
+                self._record_readiness(instance, environment, plan, environment["postcheck"])
             self._describe(instance, environment)
             environment["candidate"] = bool(not install and existing and existing.get("status") in {"ready", "modified"})
             self._save(instance, environment)

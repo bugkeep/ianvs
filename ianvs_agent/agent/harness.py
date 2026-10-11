@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ianvs_agent.agent.events import EventBus
+from ianvs_agent.agent.completion import CompletionManager, register_completion
 from ianvs_agent.context.builder import ContextManager
 from ianvs_agent.llm.provider import Provider
 from ianvs_agent.llm.usage import UsageTracker
@@ -58,9 +59,11 @@ class AgentHarness:
         self._providers = []
         self._session_save_guard = asyncio.Lock()
         self._session_write_lock = threading.RLock()
+        self.completion = CompletionManager(self)
         self.tools = ToolRegistry(self)
         self.registry = self.tools
         register_tools(self, self.tools)
+        register_completion(self, self.tools)
         latest = self.store.read("last_session.json", {})
         if latest:
             self.select_instance(latest["instance_id"])
@@ -103,6 +106,7 @@ class AgentHarness:
             self.task, self.state, self._messages = {}, {}, []
             self.store.write(f"instances/{instance_id}/latest_session.json", {"path": self.session_relative_path})
         self._bind_original_goal(resolve=False)
+        self.completion.contract()
         self.events.bind(instance_id=instance_id, session_id=self.session["session_id"], task_id=self.task.get("task_id"), environment_id=(self.current_instance.get("environment") or {}).get("environment_id"), run_id=None)
         self._connect_provider()
         self._save_session()
@@ -203,6 +207,7 @@ class AgentHarness:
             self.store.write(self.session_relative_path + f"/tasks/{self.task['task_id']}.json", {"task": self.task, "state": self.state})
         task_id = self.store.allocate_id("task")
         self.task = {"schema_version": 1, "task_id": task_id, "kind": kind, "instance_id": self.current_instance["instance_id"], "goal": goal, "benchmark_path": self.current_instance["benchmark_path"], "code_root": self.current_instance["code_root"], "readme_path": self.current_instance.get("readme_path"), "acceptance": {"original_benchmark_path": self.current_instance["benchmark_path"], **acceptance}, "created_at": now()}
+        self.task["completion_mode"] = "declared"
         self.state = {"status": "pending", "facts": [], "hypotheses": [], "changes": [], "verification": {}, "repair_attempts": 0}
         self.current_instance = self.instances.get(self.current_instance["instance_id"])
         previous_run = self.current_instance.get("last_run_id")
@@ -226,10 +231,10 @@ class AgentHarness:
         return await self._action(self._run_current(), task_budget=True)
 
     async def _run_current(self):
+        if self.task.get("kind") != "run" or self.completion.contract():
+            return await self._loop()
         result = await self._run()
         passed = result["verification"].get("passed") is True
-        if self.task.get("kind") == "repair":
-            passed = self._repair_is_complete()
         await self._finish("completed" if passed else "failed", "当前运行已通过独立验证" if passed else "当前运行未通过独立验证，运行证据已保存")
         return result
 
@@ -278,21 +283,35 @@ class AgentHarness:
         await self._save_session_async()
         return {"run": self.state["last_run"], "verification": verification, "failure": self.state["failure"]}
 
+    @staticmethod
+    def _resume_suffix(text):
+        instruction = text.strip()
+        separators = "，,。.!！；;：:、？?"
+        for prefix in ("继续当前任务", "继续原任务", "继续任务", "继续", "/resume", "resume", "continue"):
+            if instruction.lower().startswith(prefix):
+                suffix = instruction[len(prefix):]
+                if not suffix or suffix[0].isspace() or suffix[0] in separators:
+                    return suffix.strip().strip(separators).strip()
+        return None
+
     async def send_message(self, text):
         self._require_instance()
         if self.busy:
             raise RuntimeError("当前任务正在执行")
         if not text.strip():
             raise ValueError("任务内容不能为空")
-        if text.strip().rstrip("。.!！").lower() in {"继续", "继续任务", "继续当前任务", "继续原任务", "resume", "continue", "/resume"} and self.task and self.state.get("status") in {"failed", "blocked", "cancelled", "interrupted"}:
+        if self._resume_suffix(text) is not None and self.task and self.state.get("status") in {"failed", "blocked", "cancelled", "interrupted", "completed"}:
             return await self.resume_current(text.strip())
-        requested_repair = any(word in text.lower() for word in ("修复", "repair", "fix "))
-        self._ensure_task(text.strip(), kind="repair" if requested_repair else "conversation")
-        if requested_repair:
-            self.task["kind"] = "repair"
-            self.task["acceptance"]["repair_task_id"] = self.task["task_id"]
-            self.task["acceptance"]["repair_started_at"] = self.task["created_at"]
+        previous_id = self.task.get("task_id")
+        self._ensure_task(text.strip(), kind="conversation")
         self._messages.append({"role": "user", "content": text.strip()})
+        source = self.events.emit("task.user_instruction", {"text": text.strip(), "history_index": len(self._messages) - 1})
+        if self.task.get("task_id") == previous_id:
+            self.task.setdefault("goal_updates", []).append({"text": text.strip(), "history_index": len(self._messages) - 1, "event_id": source["event_id"]})
+            if self.completion.contract():
+                self.state["completion_revision_pending"] = True
+        elif not self.task.get("goal_source"):
+            self.task["goal_source"] = {"event_id": source["event_id"], "history_index": len(self._messages) - 1}
         self._save_session()
         return await self._action(self._loop(), task_budget=True)
 
@@ -300,8 +319,14 @@ class AgentHarness:
         self._require_instance()
         if self.busy:
             raise RuntimeError("当前任务正在执行")
-        if not self.task or self.state.get("status") not in {"failed", "blocked", "cancelled", "interrupted"}:
+        if not self.task or self.state.get("status") not in {"failed", "blocked", "cancelled", "interrupted", "completed"}:
             raise ValueError("当前没有可以继续的未完成任务")
+        if self.state.get("status") == "completed":
+            self.current_instance = await self._run_sync(self.instances.check_changes, self.current_instance["instance_id"], False)
+            if self.completion.contract() and (await self._run_sync(self.completion.evaluate))["ready"]:
+                raise ValueError("当前任务的全部正式成果仍然有效，新的要求请作为新任务提交")
+            self.events.emit("task.reopened", {"previous_status": "completed", "reason": "用户要求继续，完整成果缺少当前证据"})
+            self.state["status"] = "interrupted"
         # 只增加续作动作，原目标、验收、工具记录和累计用量均沿用。
         self.usage.check_budget(self.settings)
         if self.task.get("kind") == "conversation":
@@ -309,9 +334,31 @@ class AgentHarness:
             operations = {event["payload"].get("operation_id") for event in events if event.get("task_id") == self.task["task_id"] and event.get("event_type") in {"tool.completed", "tool.failed"}}
             await self._run_sync(self._update_task_progress, [{"operation_id": operation} for operation in operations if operation])
         self.state["resume_count"] = self.state.get("resume_count", 0) + 1
-        self._messages.append({"role": "user", "content": text or "继续原任务，使用已有正式证据核查当前状态并完成剩余动作；保持原目标、验收和累计用量记录。"})
+        instruction = text or "继续原任务，使用已有正式证据核查当前状态并完成剩余动作；保持原目标、验收和累计用量记录。"
+        self._messages.append({"role": "user", "content": instruction})
+        source = self.events.emit("task.user_instruction", {"text": instruction, "history_index": len(self._messages) - 1, "resume": True})
+        if text and self._resume_suffix(text):
+            self.task.setdefault("goal_updates", []).append({"text": instruction, "history_index": len(self._messages) - 1, "event_id": source["event_id"]})
+            if self.completion.contract():
+                self.state["completion_revision_pending"] = True
         await self._save_session_async()
         return await self._action(self._loop(), task_budget=True)
+
+    async def _complete_goal(self, observation=None):
+        progress = await self._run_sync(self.completion.evaluate)
+        contract = self.completion.contract()
+        answer_only = bool(contract) and all(item["kind"] == "answer" for item in contract["requirements"])
+        if progress["ready"] and not answer_only and (observation or {}).get("decision") == "completed":
+            self.current_instance = await self._run_sync(self.instances.check_changes, self.current_instance["instance_id"], False)
+            progress = await self._run_sync(self.completion.evaluate)
+        if progress["ready"] and (answer_only or (observation or {}).get("decision") == "completed"):
+            message = self.state["completion_answer"]["text"] if answer_only else (observation or {}).get("next_goal") or "全部任务要求已有本轮执行与验证证据"
+            return await self._finish("completed", message)
+        if (observation or {}).get("decision") == "completed" and not progress["ready"]:
+            self.state["observation_decision"] = "continue"
+            self.state["next_goal"] = "继续完成尚缺少正式证据的要求：" + "；".join(progress["missing"])
+        await self._save_session_async()
+        return None
 
     def _repair_is_complete(self):
         instance = self.instances.get(self.current_instance["instance_id"])
@@ -332,6 +379,9 @@ class AgentHarness:
         return complete
 
     def _requires_observation(self, calls):
+        contract = self.completion.contract()
+        if contract and any(item["kind"] != "answer" for item in contract["requirements"]) and (self.state.get("completion_progress") or {}).get("ready"):
+            return True
         return self.task.get("kind") != "conversation" or any(not self.tools.is_read_only(call["name"], call.get("arguments")) for call in calls)
 
     async def _loop(self):
@@ -350,11 +400,7 @@ class AgentHarness:
             if self._compact_requested:
                 await self._compact()
             self.usage.check_budget(self.settings)
-            if self.task.get("kind") == "repair" and await self._run_sync(self._repair_is_complete):
-                return await self._finish("completed", "原始任务已经通过本轮独立验证")
-            if self.task.get("kind") == "maintenance" and await self._run_sync(self._maintenance_is_complete):
-                self.state["maintenance_progress"]["phase"] = "completed"
-                return await self._finish("completed", "当前安装与运维步骤已通过真实环境检查")
+            await self._run_sync(self.completion.evaluate)
             response = await self.context.complete(self.task, self.state, self._messages, self.tools.definitions(), role="plan", purpose="plan")
             await self._record_assistant(response, "plan")
             calls = response["tool_calls"]
@@ -375,32 +421,24 @@ class AgentHarness:
                     await self._save_session_async()
                 await self._run_sync(self._update_task_progress, results)
                 await self._save_session_async()
-                if self._repair_is_complete():
-                    return await self._finish("completed", "原始任务已经通过本轮独立验证")
-                if self.task.get("kind") == "maintenance" and await self._run_sync(self._maintenance_is_complete):
-                    self.state["maintenance_progress"]["phase"] = "completed"
-                    return await self._finish("completed", "当前安装与运维步骤已通过真实环境检查")
+                completed = await self._complete_goal()
+                if completed:
+                    return completed
                 if not self._requires_observation(calls):
                     self.state.pop("observation_decision", None)
                     self.state["next_goal"] = "继续完成当前用户授权目标；根据本轮真实工具结果安排尚未完成的动作，普通问题已有充分证据时直接答复"
                     continue
             else:
-                if self._repair_is_complete():
-                    return await self._finish("completed", "原始任务已经通过本轮独立验证")
-                if self.task.get("kind") == "conversation":
-                    return await self._finish("completed", response["content"] or "对话任务已完成")
-                if self.task.get("kind") == "maintenance":
-                    if await self._run_sync(self._maintenance_is_complete):
-                        self.state["maintenance_progress"]["phase"] = "completed"
-                        return await self._finish("completed", response["content"] or "当前安装与运维步骤已通过真实环境检查")
+                if not self.completion.contract() or self.state.get("completion_revision_pending"):
+                    self._messages.append({"role": "user", "content": "当前尚未声明完整完成清单。请调用 declare_completion_contract；普通问答在同一调用提供 answer 成果及 answer_text，行动任务完整声明 environment、benchmark、code 所需成果。仅有文字不能确认任务完成。"})
+                    await self._save_session_async()
+                    continue
             observation = await self._observe(allow_text=not calls)
             if self._compact_requested:
                 await self._compact()
-            if self._repair_is_complete():
-                return await self._finish("completed", "原始任务已经通过本轮独立验证")
-            if self.task.get("kind") == "maintenance" and await self._run_sync(self._maintenance_is_complete):
-                self.state["maintenance_progress"]["phase"] = "completed"
-                return await self._finish("completed", "当前安装与运维步骤已通过真实环境检查")
+            completed = await self._complete_goal(observation)
+            if completed:
+                return completed
             if observation.get("decision") == "blocked":
                 return await self._finish("blocked", observation.get("next_goal") or "当前任务缺少必要条件")
         raise asyncio.CancelledError
@@ -438,7 +476,7 @@ class AgentHarness:
         records = [{**record, "arguments": record.get("arguments") if isinstance(record.get("arguments"), dict) else {}} for record in self.store.read_events(self.session_relative_path + "/tools.jsonl") if record.get("operation_id") in operations]
         previous = self.state.get("maintenance_progress") or {}
         mutations = [record for record in records if record["name"] in self.tools.tools and not self.tools.is_read_only(record["name"], record.get("arguments"))]
-        pending_plans = [record for record in records if record["name"] == "install_dependencies" and record.get("arguments", {}).get("action") == "plan" and isinstance(record.get("data"), dict) and record["data"].get("requires_install") is True]
+        pending_plans = [record for record in records if self.completion.is_install_plan(record)]
         installation_planned = any(record["name"] == "install_dependencies" and record.get("arguments", {}).get("action") == "plan" for record in records)
         if not mutations and not installation_planned and self.task.get("kind") != "maintenance":
             return
@@ -448,7 +486,7 @@ class AgentHarness:
         for record in records:
             actions.append({"name": record["name"], "status": record["status"], "evidence_ref": "tool:" + record["operation_id"], "error": record.get("error")})
             if record["name"] == "install_dependencies" and record.get("arguments", {}).get("action") == "plan":
-                progress.update(install_pending=True, phase="checks_pending")
+                progress["phase"] = "checks_pending"
                 progress.pop("environment_check", None)
             if record["name"] == "inspect_environment":
                 progress["phase"] = "checks_pending"
@@ -467,8 +505,9 @@ class AgentHarness:
                 if formal.get("source_kind") == "observed_environment" and formal.get("task_id") == self.task["task_id"]:
                     progress["environment_check"] = {key: formal.get(key) for key in ("check_id", "instance_id", "task_id", "environment_id", "generation", "status", "passed", "checked_at", "evidence_ref", "dependency_fingerprint", "requirements_files", "file_versions")}
                     progress["phase"] = "checks_pending" if formal.get("passed") is True else "checks_failed"
-                    if record["name"] == "install_dependencies" and record.get("arguments", {}).get("action") == "apply" and formal.get("passed") is True:
-                        progress["install_pending"] = False
+        progress["install_pending"] = self.completion.installation_pending()
+        if not progress["install_pending"]:
+            progress.pop("pending_plan_id", None)
         progress["recent_actions"] = actions[-8:]
         self.state["maintenance_progress"] = progress
         if self._maintenance_is_complete():
@@ -619,7 +658,7 @@ class AgentHarness:
         result = format_task_result(self.task, self.state, status, message, run, reference)
         self.state["result"] = result
         await self._save_session_async()
-        if status != "completed" or self.task.get("kind") != "conversation":
+        if status != "completed" or self.task.get("kind") != "conversation" or self.task.get("completion_contract"):
             self.events.emit("agent.message", {"role": "result", "content": result["content"]})
         event_type = {"completed": "agent.completed", "blocked": "agent.blocked", "failed": "agent.failed", "cancelled": "agent.cancelled"}[status]
         self.events.emit(event_type, {"message": message, "content": result["content"], "result": result, "verification": self.state.get("verification", {}), **({"error": message} if status == "failed" else {})})

@@ -4,8 +4,11 @@
 import copy
 import hashlib
 import json
+import math
 import os
+import py_compile
 import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -49,6 +52,25 @@ class OriginalGoalTests(unittest.TestCase):
             instance.pop(key, None)
         self.store.write(f"instances/{instance['instance_id']}/instance.json", instance)
         return instance
+
+    def dotted_module_fixture(self, package=False, module_name="goal_import_probe"):
+        self.copy_example()
+        name = "examples.llm_simple_qa.testalgorithms.gen." + module_name
+        relative = name.replace(".", "/") + ("/__init__.py" if package else ".py")
+        target = self.source / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        original = self.project / "examples/imagenet/multiedge_inference_bench/testalgorithms/automatic/utils/yaml_types.py"
+        shutil.copy2(original, target)
+        path = self.source / "examples/llm_simple_qa/testalgorithms/gen/gen_algorithm.yaml"
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        document["algorithm"]["modules"][0]["url"] = name
+        path.write_text(yaml.safe_dump(document), encoding="utf-8")
+        return name, relative
+
+    def import_probe(self, instance, declared):
+        environment = dict(os.environ, PYTHONPATH=str(self.project), PYTHONDONTWRITEBYTECODE="1")
+        helper = self.project / "ianvs_agent/tests/original_goal_import_probe.py"
+        return subprocess.run([sys.executable, str(helper), declared], cwd=instance["code_root"], env=environment, capture_output=True, text=True, timeout=30, check=False)
 
     def test_creation_archives_exact_bytes_and_survives_source_edits(self):
         self.copy_example()
@@ -152,6 +174,169 @@ class OriginalGoalTests(unittest.TestCase):
         self.assertNotEqual(hashlib.sha256(target.read_bytes()).hexdigest(), binding["sha256"])
         checks = compare_goal(instance, goal, configuration_evidence(instance["code_root"], instance["benchmark_path"]), file_manifest(instance["code_root"]))
         self.assertTrue(all(checks.values()), checks)
+
+    def test_real_phys_scene_module_name_binds_creation_source_without_importing_model(self):
+        relative = self.copy_example("examples/phys_scene_gen/singletask_learning_bench")
+        instance = self.create(relative)
+        self.assertEqual(instance["task_spec"]["status"], "complete")
+        goal = self.goals.load(instance)
+        self.assertEqual(goal["status"], "complete", goal["unresolved"])
+        binding = next(item for item in goal["bindings"] if item["field"] == "algorithms/0/algorithm/modules/0/url")
+        self.assertEqual(binding["binding_basis"], "python_module_reference")
+        self.assertEqual(binding["path"], relative + "/testalgorithms/ai2holodeck/phys_scene_generator.py")
+        self.assertEqual(binding["sha256"], instance["source_manifest"][binding["path"]])
+        self.assertIn({"kind": "namespace", "path": "examples"}, binding["python_module_chain"])
+        self.assertIn({"kind": "package", "path": relative + "/testalgorithms/ai2holodeck/__init__.py"}, binding["python_module_chain"])
+        root = Path(instance["code_root"])
+        evidence = configuration_evidence(root, instance["benchmark_path"])
+        self.assertTrue(all(compare_goal(instance, goal, evidence, file_manifest(root)).values()))
+        target = root / binding["path"]
+        target.write_bytes(target.read_bytes() + "\n# 验证模块源码修改后的目标身份\n".encode("utf-8"))
+        self.assertTrue(all(compare_goal(instance, goal, evidence, file_manifest(root)).values()))
+        self.assertEqual(self.goals.load(instance), goal)
+
+    def test_dotted_source_module_matches_real_core_import_origin(self):
+        declared, relative = self.dotted_module_fixture()
+        instance = self.create()
+        goal = self.goals.load(instance)
+        self.assertEqual(goal["status"], "complete", goal["unresolved"])
+        imported = self.import_probe(instance, declared)
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assertEqual(Path(json.loads(imported.stdout)["origin"]), Path(instance["code_root"]) / relative)
+        root = Path(instance["code_root"])
+        self.assertTrue(all(compare_goal(instance, goal, configuration_evidence(root, instance["benchmark_path"]), file_manifest(root)).values()))
+
+    def test_dotted_package_matches_real_core_import_origin(self):
+        declared, relative = self.dotted_module_fixture(package=True)
+        instance = self.create()
+        goal = self.goals.load(instance)
+        self.assertEqual(goal["status"], "complete", goal["unresolved"])
+        binding = next(item for item in goal["bindings"] if item["declared"] == declared)
+        self.assertEqual(binding["path"], relative)
+        imported = self.import_probe(instance, declared)
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assertEqual(Path(json.loads(imported.stdout)["origin"]), Path(instance["code_root"]) / relative)
+
+    def test_dotted_module_and_package_conflict_requires_binding(self):
+        declared, relative = self.dotted_module_fixture()
+        destination = self.source / declared.replace(".", "/") / "__init__.py"
+        destination.parent.mkdir()
+        shutil.copy2(self.source / relative, destination)
+        instance = self.create()
+        goal = self.goals.load(instance)
+        self.assertEqual(goal["status"], "needs_binding")
+        issue = next(item for item in goal["unresolved"] if item.get("declared") == declared)
+        self.assertEqual(issue["reason"], "ambiguous_reference")
+        self.assertEqual(set(issue["candidates"]), {relative, declared.replace(".", "/") + "/__init__.py"})
+
+    def test_added_dotted_package_cannot_change_import_origin_without_goal_failure(self):
+        declared, relative = self.dotted_module_fixture()
+        instance = self.create()
+        goal = self.goals.load(instance)
+        root = Path(instance["code_root"])
+        destination = root / declared.replace(".", "/") / "__init__.py"
+        destination.parent.mkdir()
+        shutil.copy2(root / relative, destination)
+        imported = self.import_probe(instance, declared)
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assertEqual(Path(json.loads(imported.stdout)["origin"]), destination)
+        checks = compare_goal(instance, goal, configuration_evidence(root, instance["benchmark_path"]), file_manifest(root))
+        self.assertFalse(checks["原始算法目标与配置来源保持一致"])
+
+    def test_namespace_parent_shadow_is_rejected_at_creation_and_current_comparison(self):
+        declared, _ = self.dotted_module_fixture()
+        instance = self.create()
+        goal = self.goals.load(instance)
+        root = Path(instance["code_root"])
+        shadow = "examples/llm_simple_qa/testalgorithms/gen.py"
+        shutil.copy2(self.project / "core/common/constant.py", root / shadow)
+        imported = self.import_probe(instance, declared)
+        self.assertNotEqual(imported.returncode, 0)
+        self.assertIn("not a package", imported.stderr)
+        checks = compare_goal(instance, goal, configuration_evidence(root, instance["benchmark_path"]), file_manifest(root))
+        self.assertFalse(checks["原始算法目标与配置来源保持一致"])
+        shutil.copy2(self.project / "core/common/constant.py", self.source / shadow)
+        blocked = self.create()
+        blocked_goal = self.goals.load(blocked)
+        self.assertEqual(blocked_goal["status"], "source_missing")
+        self.assertTrue(any(item.get("declared") == declared and item["reason"] == "creation_source_missing" for item in blocked_goal["unresolved"]))
+
+    def test_dotted_module_symbolic_import_competitors_fail_with_unchanged_manifest(self):
+        declared, relative = self.dotted_module_fixture()
+        shutil.copy2(self.project / "core/common/constant.py", self.source / "import_shadow.py")
+        instance = self.create()
+        goal = self.goals.load(instance)
+        root = Path(instance["code_root"])
+        evidence = configuration_evidence(root, instance["benchmark_path"])
+        manifest = file_manifest(root)
+        package = root / declared.replace(".", "/")
+        package.mkdir()
+        targets = ((package / "__init__.py", root / relative, "package"), (root / "examples/llm_simple_qa/testalgorithms/gen.py", root / "import_shadow.py", "parent_module"), (root / "examples/llm_simple_qa/testalgorithms/gen/__init__.py", root / "import_shadow.py", "parent_package"))
+        for link, destination, kind in targets:
+            try:
+                link.symlink_to(destination)
+            except OSError as error:
+                if os.name == "nt" and error.winerror in (5, 1314):
+                    self.skipTest("Windows 当前权限不允许创建符号链接")
+                raise
+            try:
+                with self.subTest(kind=kind):
+                    self.assertEqual(file_manifest(root), manifest)
+                    imported = self.import_probe(instance, declared)
+                    if kind == "parent_module":
+                        self.assertNotEqual(imported.returncode, 0)
+                        self.assertIn("not a package", imported.stderr)
+                    else:
+                        self.assertEqual(imported.returncode, 0, imported.stderr)
+                        expected = link if kind == "package" else root / relative
+                        self.assertEqual(Path(json.loads(imported.stdout)["origin"]), expected)
+                    self.assertFalse(compare_goal(instance, goal, evidence, manifest)["原始算法目标与配置来源保持一致"])
+            finally:
+                link.unlink()
+        self.assertTrue(all(compare_goal(instance, goal, evidence, file_manifest(root)).values()))
+
+    def test_changed_dotted_module_cannot_be_relabelled_as_creation_source(self):
+        declared, relative = self.dotted_module_fixture()
+        instance = self.legacy(self.create())
+        for root in (self.source, Path(instance["code_root"])):
+            target = root / relative
+            target.write_bytes(target.read_bytes() + "\n# 修改后的模块不能充当创建版本\n".encode("utf-8"))
+        goal = self.goals.resolve(instance)
+        self.assertEqual(goal["status"], "source_missing")
+        self.assertTrue(any(item.get("declared") == declared and item["reason"] == "creation_bytes_unavailable" for item in goal["unresolved"]))
+
+    def test_added_extension_cannot_replace_dotted_source_import(self):
+        if not getattr(math, "__file__", None):
+            self.skipTest("当前 Python 将 math 内置，缺少可复制的动态扩展文件")
+        declared, relative = self.dotted_module_fixture(module_name="math")
+        instance = self.create()
+        goal = self.goals.load(instance)
+        root = Path(instance["code_root"])
+        extension = Path(math.__file__)
+        destination = (root / relative).parent / extension.name
+        shutil.copy2(extension, destination)
+        imported = self.import_probe(instance, declared)
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assertEqual(Path(json.loads(imported.stdout)["origin"]), destination)
+        checks = compare_goal(instance, goal, configuration_evidence(root, instance["benchmark_path"]), file_manifest(root))
+        self.assertFalse(checks["原始算法目标与配置来源保持一致"])
+
+    def test_added_bytecode_package_fails_identity_with_unchanged_source_manifest(self):
+        declared, relative = self.dotted_module_fixture()
+        instance = self.create()
+        goal = self.goals.load(instance)
+        root = Path(instance["code_root"])
+        manifest = file_manifest(root)
+        package = root / declared.replace(".", "/")
+        package.mkdir()
+        bytecode = package / "__init__.pyc"
+        py_compile.compile(str(root / relative), cfile=str(bytecode), doraise=True)
+        self.assertEqual(file_manifest(root), manifest)
+        imported = self.import_probe(instance, declared)
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assertEqual(Path(json.loads(imported.stdout)["origin"]), bytecode)
+        checks = compare_goal(instance, goal, configuration_evidence(root, instance["benchmark_path"]), manifest)
+        self.assertFalse(checks["原始算法目标与配置来源保持一致"])
 
     def test_unique_suffix_module_url_repair_retains_same_algorithm_goal(self):
         relative = self.copy_example("examples/Cloud_Robotics/cloud-edge-collaborative-inference_bench/perception-reasoning")

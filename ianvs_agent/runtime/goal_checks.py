@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from importlib.machinery import BYTECODE_SUFFIXES, EXTENSION_SUFFIXES
 from pathlib import Path
 
 import yaml
+
+from .original_goal import python_module_candidates
 
 
 def goal_summary(goal):
@@ -41,14 +44,30 @@ def _directory_has_symbolic_links(root, directory):
     return False
 
 
+def _python_module_has_import_competitors(root, declared):
+    path = root
+    for part in declared.split("."):
+        path = path / part
+        if path.is_symlink() or path.with_suffix(".py").is_symlink() or (path / "__init__.py").is_symlink():
+            return True
+        for suffix in EXTENSION_SUFFIXES + BYTECODE_SUFFIXES:
+            candidates = (path.with_name(path.name + suffix), path / ("__init__" + suffix))
+            if any(candidate.exists() or candidate.is_symlink() for candidate in candidates):
+                return True
+    return False
+
+
 def compare_goal(instance, goal, evidence, current_manifest):
     root = Path(instance["code_root"]).resolve()
     documents = goal.get("documents") or {}
     paths = set(instance["source_manifest"])
     aliases = {}
+    module_references = {}
     for binding in goal.get("bindings", []):
         aliases.setdefault(binding["declared"], set()).add(binding["path"])
         paths.add(binding["path"])
+        if binding.get("binding_basis") == "python_module_reference":
+            module_references[binding["declared"]] = binding
 
     def canonical(value, original=False):
         if isinstance(value, dict):
@@ -60,6 +79,12 @@ def compare_goal(instance, goal, evidence, current_manifest):
         matches = aliases.get(value, set()) if original else set()
         if len(matches) == 1:
             return next(iter(matches))
+        if not original and value in module_references:
+            binding = module_references[value]
+            candidates, chain = python_module_candidates(value, current_manifest)
+            if candidates == [binding["path"]] and chain == binding["python_module_chain"] and not _python_module_has_import_competitors(root, value):
+                return binding["path"]
+            return value
         if "\x00" in value or "://" in value:
             return value
         path = (root / value).resolve()

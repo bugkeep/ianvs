@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import sys
 import unittest
 import uuid
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import yaml
 from filelock import FileLock
+from packaging.utils import parse_wheel_filename
 
 from ianvs_agent.agent.harness import AgentHarness
 from ianvs_agent.config import AgentSettings, ModelProfile
@@ -53,6 +55,52 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def read_sample(self):
         return await self.harness.tools.execute(self.call("read_file", {"path": "examples/tool-check/sample.txt"}))
+
+    async def test_environment_readiness_and_failed_candidate_evidence_are_readable(self):
+        wheel_root = os.environ.get("IANVS_ENVIRONMENT_WHEEL_ROOT")
+        if not wheel_root:
+            self.skipTest("需要真实 wheel 缓存完成独立环境安装")
+        wheel = next(Path(wheel_root).rglob("packaging-*.whl"))
+        version = str(parse_wheel_filename(wheel.name)[1])
+        wheel_directory = self.code_root / "wheels"
+        wheel_directory.mkdir()
+        shutil.copy2(wheel, wheel_directory / wheel.name)
+        (self.code_root / "dependencies.txt").write_text(f"--no-index\n--find-links ./wheels\npackaging=={version}\n", encoding="utf-8")
+        instance = self.harness.current_instance
+        plan = await self.harness.environment.plan_install(instance, requirements_files=["dependencies.txt"], modules=["packaging"])
+        healthy = await self.harness.environment.install(instance, plan["plan_id"])
+        reference = healthy["readiness_ref"]
+        evidence = await self.harness.tools.execute(self.call("read_evidence", {"reference": reference}))
+        self.assertEqual(evidence["status"], "success")
+        self.assertIn('"modules"', evidence["data"]["content"])
+        scope_path = self.harness.store.path(reference)
+        original_scope = scope_path.read_bytes()
+        failed_plan = await self.harness.environment.plan_install(instance, modules=["ianvs_missing_candidate_probe"])
+        with self.assertRaises(RuntimeError):
+            await self.harness.environment.install(instance, failed_plan["plan_id"])
+        summary = CodeTools(self.harness)._instance_summary(instance)
+        self.assertEqual(summary["environment"]["environment_id"], healthy["environment_id"])
+        self.assertEqual(summary["last_environment_attempt"]["environment_id"], failed_plan["candidate_environment_id"])
+        self.assertEqual(summary["last_environment_attempt"]["status"], "failed")
+        failed = self.harness.store.read(f"environments/{failed_plan['candidate_environment_id']}/environment.json")
+        log = failed["postcheck"]["log_ref"]
+        result = await self.harness.tools.execute(self.call("read_evidence", {"reference": log}))
+        self.assertEqual(result["status"], "success")
+        invalid = await self.harness.tools.execute(self.call("read_evidence", {"reference": "state/" + result["data"]["reference"]}))
+        self.assertEqual(invalid["status"], "error")
+        self.assertIn("不要额外添加 state/", invalid["error"])
+        corrupted = json.loads(original_scope)
+        corrupted["request"]["modules"] = []
+        scope_path.write_text(json.dumps(corrupted), encoding="utf-8")
+        rejected = await self.harness.tools.execute(self.call("read_evidence", {"reference": reference}))
+        self.assertEqual(rejected["status"], "error")
+        self.assertIn("版本发生变化", rejected["error"])
+        scope_path.write_bytes(original_scope)
+        await self.harness.create_instance("examples/tool-check/benchmarkingjob.yaml")
+        rejected = await self.harness.tools.execute(self.call("read_evidence", {"reference": reference}))
+        self.assertEqual(rejected["status"], "error")
+        self.assertEqual(scope_path.read_bytes(), original_scope)
+        self.assertEqual(self.harness.usage_summary()["model_calls"], 0)
 
     @staticmethod
     def patch_for(path, before="value=before", after="value=after"):
@@ -585,7 +633,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_compaction_preserves_actual_failed_run_result(self):
         with self.assertRaisesRegex(RuntimeError, "环境尚未准备"):
-            await self.harness.run_current()
+            await self.harness._action(self.harness._run(), task_budget=True)
         original_task = json.loads(json.dumps(self.harness.task))
         original_state = json.loads(json.dumps(self.harness.state))
         instance_id = self.harness.current_instance["instance_id"]

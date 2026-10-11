@@ -16,6 +16,7 @@ from ianvs_agent.config import AgentSettings
 from ianvs_agent.runtime.environment import EnvironmentManager
 from ianvs_agent.runtime.instances import InstanceManager
 from ianvs_agent.storage.local_store import LocalStore
+from ianvs_agent.tools.operations import check_summary
 
 
 class EnvironmentOperationsTests(unittest.IsolatedAsyncioTestCase):
@@ -181,6 +182,155 @@ class EnvironmentOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(failed["postcheck"]["passed"])
         self.assertTrue(failed["postcheck"]["pip_check"]["passed"])
         self.assertEqual(self.store.read(plan["evidence_ref"])["status"], "failed")
+
+    async def test_readiness_preserves_original_modules_and_recovers_after_real_import_repair(self):
+        healthy = await self.healthy_install()
+        scope_path = self.store.path(healthy["readiness_ref"])
+        original_scope = scope_path.read_bytes()
+        scope = self.store.read(healthy["readiness_ref"])
+        self.assertEqual(scope["request"]["modules"], ["packaging"])
+        self.assertEqual(scope["postcheck_ref"], healthy["postcheck"]["evidence_ref"])
+        module = next(Path(healthy["venv_root"]).glob("lib/python*/site-packages/packaging/__init__.py"))
+        original_module = module.read_bytes()
+        module.write_text("raise ImportError('readiness regression: original module unavailable')\n", encoding="utf-8")
+        failed = await self.manager.inspect(self.instance, requirements_files=[], modules=[])
+        self.assertEqual(failed["request"]["modules"], ["packaging"])
+        self.assertEqual(failed["request"]["requirements_files"], ["dependencies/requirements.txt"])
+        self.assertFalse(failed["passed"])
+        self.assertFalse(failed["package_drift"])
+        self.assertFalse(failed["readiness"]["passed"])
+        self.assertEqual(healthy["status"], "modified")
+        failed_bytes = self.store.path(failed["evidence_ref"]).read_bytes()
+        module.write_bytes(original_module)
+        reloaded = self.store.read(f"instances/{self.instance['instance_id']}/instance.json")
+        manager = EnvironmentManager(self.settings, self.store, self.events)
+        restored = await manager.inspect(reloaded)
+        self.assertTrue(restored["passed"])
+        self.assertTrue(restored["readiness"]["passed"])
+        self.assertEqual(restored["request"]["modules"], ["packaging"])
+        self.assertEqual(reloaded["environment"]["status"], "ready")
+        self.assertEqual(reloaded["environment"]["generation"], healthy["generation"])
+        self.assertEqual(reloaded["environment"]["check_failure_ref"], failed["evidence_ref"])
+        self.assertEqual(reloaded["environment"]["readiness_recovery_ref"], restored["evidence_ref"])
+        self.assertEqual(scope_path.read_bytes(), original_scope)
+        self.assertEqual(self.store.path(failed["evidence_ref"]).read_bytes(), failed_bytes)
+
+    async def test_additional_import_probe_retains_original_readiness_and_failed_evidence(self):
+        healthy = await self.healthy_install()
+        scope_path = self.store.path(healthy["readiness_ref"])
+        original_scope = scope_path.read_bytes()
+        probe = "ianvs_environment_dependency_that_does_not_exist"
+        failed = await self.manager.inspect(self.instance, modules=[probe])
+        self.assertFalse(failed["passed"])
+        self.assertTrue(failed["readiness"]["passed"])
+        self.assertEqual(failed["request"]["modules"], ["packaging", probe])
+        self.assertEqual(healthy["status"], "ready")
+        self.assertFalse(healthy["current_check"]["passed"])
+        checked = await self.manager.inspect(self.instance, requirements_files=[], modules=[])
+        self.assertTrue(checked["passed"])
+        self.assertEqual(checked["request"]["modules"], ["packaging"])
+        self.assertEqual(healthy["status"], "ready")
+        self.assertEqual(scope_path.read_bytes(), original_scope)
+        self.assertFalse(self.store.read(failed["evidence_ref"])["passed"])
+
+    async def test_empty_inspection_cannot_remove_original_constraints_or_changed_declarations(self):
+        await self.healthy_install()
+        constraints = self.dependency_file("dependencies/constraints.txt", "packaging==26.3\n")
+        plan = await self.manager.plan_install(self.instance, constraints_files=["dependencies/constraints.txt"])
+        healthy = await self.manager.install(self.instance, plan["plan_id"])
+        empty_request = {"requirements_files": [], "constraints_files": [], "packages": [], "modules": [], "index_url": None}
+        checked = await self.manager.inspect(self.instance, request=empty_request)
+        self.assertTrue(checked["passed"])
+        for key in ("requirements_files", "constraints_files", "packages", "modules"):
+            self.assertEqual(checked["request"][key], plan["request"][key])
+        constraints.write_text("packaging==25.0\n", encoding="utf-8")
+        changed = await self.manager.inspect(self.instance, request=empty_request)
+        self.assertFalse(changed["passed"])
+        self.assertFalse(changed["readiness"]["passed"])
+        self.assertFalse(changed["package_drift"])
+        self.assertEqual(healthy["status"], "modified")
+        again = await self.manager.inspect(self.instance, requirements_files=[], modules=[])
+        self.assertFalse(again["passed"])
+        self.assertEqual(healthy["status"], "modified")
+
+    async def test_additional_requirements_failures_preserve_original_readiness(self):
+        healthy = await self.healthy_install()
+        scope_path = self.store.path(healthy["readiness_ref"])
+        original_scope = scope_path.read_bytes()
+        probes = (("extra-missing.txt", "ianvs-readiness-probe-that-does-not-exist==1.0\n"), ("extra-invalid.txt", "packaging==\n"))
+        for name, content in probes:
+            with self.subTest(requirements=name):
+                self.dependency_file(name, content)
+                checked = await self.manager.inspect(self.instance, requirements_files=[name], modules=[])
+                self.assertFalse(checked["passed"])
+                self.assertTrue(checked["readiness"]["passed"])
+                self.assertTrue(checked["readiness_dependencies"]["passed"])
+                self.assertTrue(all(item.get("satisfied", True) for item in checked["readiness_dependencies"]["requirements"]))
+                self.assertEqual(healthy["status"], "ready")
+                self.assertEqual(checked["request"]["requirements_files"], ["dependencies/requirements.txt", name])
+                self.assertEqual(check_summary(checked)["readiness"], checked["readiness"])
+                self.assertEqual(check_summary(checked)["request"], checked["request"])
+                self.assertEqual(scope_path.read_bytes(), original_scope)
+                self.assertEqual(self.store.read(checked["evidence_ref"]), checked)
+        self.assertTrue(checked["dependencies"]["errors"])
+        original = await self.manager.inspect(self.instance)
+        self.assertTrue(original["passed"])
+        self.assertEqual(healthy["status"], "ready")
+
+    async def test_empty_inspection_cannot_restore_actual_package_drift(self):
+        healthy = await self.healthy_install()
+        python = healthy["python_executable"]
+        await self.manager._run_step(self.instance, healthy, "dependency_fault_injection", [python, "-m", "pip", "uninstall", "--yes", "packaging"], self.root, python, self.case_root / "readiness-package-removal.log", writable_paths=[healthy["venv_root"]])
+        for _ in range(2):
+            check = await self.manager.inspect(self.instance, requirements_files=[], modules=[])
+            self.assertFalse(check["passed"])
+            self.assertTrue(check["package_drift"])
+            self.assertFalse(check["readiness"]["passed"])
+            self.assertEqual(check["request"]["modules"], ["packaging"])
+            self.assertEqual(healthy["status"], "modified")
+        self.assertNotIn("readiness_recovery_ref", healthy)
+
+    async def test_legacy_environment_without_recorded_scope_requires_controlled_preparation(self):
+        healthy = await self.healthy_install()
+        # 使用真实安装结果验证旧格式环境缺少可用范围字段时的恢复规则。
+        healthy.pop("readiness_ref")
+        healthy.pop("readiness_fingerprint")
+        self.manager._save(self.instance, healthy)
+        failed = await self.manager.inspect(self.instance, modules=["ianvs_environment_dependency_that_does_not_exist"])
+        self.assertFalse(failed["passed"])
+        self.assertEqual(healthy["status"], "modified")
+        check = await self.manager.inspect(self.instance, modules=["packaging"])
+        self.assertTrue(check["passed"])
+        self.assertFalse(check["readiness"]["passed"])
+        self.assertIsNone(check["readiness"]["scope_ref"])
+        self.assertEqual(healthy["status"], "modified")
+        self.assertNotIn("readiness_recovery_ref", healthy)
+
+    async def test_damaged_readiness_scope_invalidates_environment_and_allows_new_candidate(self):
+        healthy = await self.healthy_install()
+        scope = self.store.read(healthy["readiness_ref"])
+        scope["request"]["modules"] = []
+        self.store.write(healthy["readiness_ref"], scope)
+        damaged_bytes = self.store.path(healthy["readiness_ref"]).read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "原始可用范围"):
+            await self.manager.inspect(self.instance)
+        self.assertEqual(healthy["status"], "modified")
+        failed_ref = healthy["check_failure_ref"]
+        failed = self.store.read(failed_ref)
+        self.assertEqual(failed["status"], "failed")
+        self.assertFalse(failed["passed"])
+        self.assertEqual(healthy["current_check"]["evidence_ref"], failed_ref)
+        self.assertNotIn("command", failed)
+        failure_bytes = self.store.path(failed_ref).read_bytes()
+        plan = await self.manager.plan_install(self.instance)
+        repaired = await self.manager.install(self.instance, plan["plan_id"])
+        self.assertEqual(repaired["status"], "ready")
+        self.assertEqual(repaired["generation"], healthy["generation"] + 1)
+        self.assertNotEqual(repaired["readiness_ref"], healthy["readiness_ref"])
+        self.assertEqual(self.manager._readiness_scope(repaired)["request"]["modules"], ["packaging"])
+        self.assertTrue((await self.manager.inspect(self.instance))["readiness"]["passed"])
+        self.assertEqual(self.store.path(healthy["readiness_ref"]).read_bytes(), damaged_bytes)
+        self.assertEqual(self.store.path(failed_ref).read_bytes(), failure_bytes)
 
     async def test_modified_environment_is_retained_until_candidate_postcheck_passes(self):
         healthy = await self.healthy_install()

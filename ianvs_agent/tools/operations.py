@@ -9,7 +9,7 @@ from ianvs_agent.runtime.environment import environment_summary
 
 
 def check_summary(check):
-    fields = ("check_id", "instance_id", "task_id", "environment_id", "generation", "status", "passed", "checked_at", "evidence_ref", "source_kind", "python_executable", "dependency_fingerprint", "requirements_files", "file_versions", "pip_check", "imports", "log_ref", "package_drift", "drift_reason", "error")
+    fields = ("check_id", "instance_id", "task_id", "environment_id", "generation", "status", "passed", "checked_at", "evidence_ref", "source_kind", "python_executable", "dependency_fingerprint", "requirements_files", "file_versions", "pip_check", "imports", "log_ref", "package_drift", "drift_reason", "error", "readiness", "request")
     result = {key: check[key] for key in fields if key in check}
     result["package_count"] = len(check.get("packages") or [])
     dependencies = check.get("dependencies") or {}
@@ -82,16 +82,29 @@ def register_operations(harness, registry, code):
         finally:
             await refresh()
 
-    async def command_approval(**parameters):
+    async def command_approval(completion_requirement_id=None, **parameters):
+        if completion_requirement_id is not None:
+            harness.completion.validate_function_requirement(completion_requirement_id)
         return await asyncio.to_thread(harness.environment_commands.preview, await asyncio.to_thread(fresh), **parameters)
 
-    async def execute_environment_command(_approved=None, **parameters):
+    async def execute_environment_command(_approved=None, completion_requirement_id=None, **parameters):
         if _approved is None:
             raise PermissionError("环境命令需要具体参数和版本的审批")
+        previous = ((await asyncio.to_thread(fresh)).get("last_environment_command") or {}).get("evidence_ref")
+        if completion_requirement_id is not None:
+            harness.state.setdefault("completion_function_check_pending", {})[completion_requirement_id] = True
+            await harness._save_session_async()
         try:
             return await harness.environment_commands.execute(await asyncio.to_thread(fresh), approved=_approved, **parameters)
         finally:
             await refresh()
+            if completion_requirement_id is not None:
+                reference = (harness.current_instance.get("last_environment_command") or {}).get("evidence_ref")
+                record = harness.store.read(reference, {}) if reference else {}
+                if reference != previous and record.get("task_id") == harness.task.get("task_id") and record.get("command") == _approved["command"] and record.get("source_revision") == _approved["source_revision"]:
+                    harness.completion.bind_function_check(completion_requirement_id, record)
+                    harness.state["completion_function_check_pending"].pop(completion_requirement_id, None)
+                    await harness._save_session_async()
 
     async def credential_approval(credential_names):
         configured = harness.settings.runtime_credentials
@@ -121,5 +134,5 @@ def register_operations(harness, registry, code):
     registry.register("inspect_environment", "核查当前实例的真实 Python、包版本、pip check、requirements 和指定模块导入；保存正式检查和日志。检查成功仅表示环境准备成功。", {"requirements_files": strings, "modules": strings}, [], inspect_environment)
     registry.register("install_dependencies", "依赖安装到当前实例独立环境。action=plan 时提供 requirements_files/packages/constraints_files/index_url/timeout/modules，核查真实声明并保存具体 pip 计划；action=apply 时仅传 plan_id，审批后创建新环境代次、执行真实安装及检查，成功后激活；失败保留原环境。", {"action": {"enum": ["plan", "apply"]}, "plan_id": string, "requirements_files": strings, "packages": strings, "constraints_files": strings, "index_url": string, "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 1800}, "modules": strings}, ["action"], install_dependencies, modifies=lambda args: not isinstance(args, dict) or args.get("action") != "plan", approval_context=install_approval)
     registry.register("prepare_instance", "按当前实例 YAML 声明生成具体准备计划，审批后准备独立环境，保留安装、检查和日志；未声明依赖通过 install_dependencies 纳入。", {}, [], prepare_instance, modifies=True, approval_context=prepare_approval)
-    registry.register("execute_environment_command", "在当前实例 Python 环境执行参数列表命令；源码、验证程序和现有环境只读，可指定实例内新生成目录；默认禁止网络。需要审批实际命令、文件版本、生成目录和网络权限。pip 安装请使用 install_dependencies。", {"argv": {**strings, "minItems": 1, "uniqueItems": False}, "cwd": string, "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 1800}, "writable_directories": strings, "network": {"type": "boolean"}}, ["argv"], execute_environment_command, modifies=True, approval_context=command_approval)
+    registry.register("execute_environment_command", "在当前实例 Python 环境执行参数列表命令；源码、验证程序和现有环境只读，可指定实例内新生成目录；默认禁止网络。需要审批实际命令、文件版本、生成目录和网络权限。验证代码功能时指定对应 code 成果的 completion_requirement_id，正式命令与日志作为该项功能检查证据。pip 安装请使用 install_dependencies。", {"argv": {**strings, "minItems": 1, "uniqueItems": False}, "cwd": string, "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 1800}, "writable_directories": strings, "network": {"type": "boolean"}, "completion_requirement_id": string}, ["argv"], execute_environment_command, modifies=True, approval_context=command_approval)
     registry.register("configure_runtime_environment", "仅将 YAML runtime_credentials 允许的环境变量引用绑定到当前实例，后端运行时加载；工具仅接收名称，禁止提供凭据值。空列表清除绑定。", {"credential_names": strings}, ["credential_names"], configure_runtime_environment, modifies=True, approval_context=credential_approval)

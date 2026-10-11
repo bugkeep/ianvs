@@ -139,6 +139,8 @@ def inspect_dependencies(root, requirements_files, constraints_files, packages):
 
 def observe_environment(root, request):
     dependencies = inspect_dependencies(root, request.get("requirements_files", []), request.get("constraints_files", []), request.get("packages", []))
+    readiness = request.get("_readiness_request")
+    readiness_dependencies = inspect_dependencies(root, readiness["requirements_files"], readiness["constraints_files"], readiness["packages"]) if readiness is not None else None
     packages = sorted([{"name": item.metadata["Name"], "version": item.version} for item in importlib.metadata.distributions()], key=lambda item: item["name"].lower())
     checked = subprocess.run([sys.executable, "-m", "pip", "--disable-pip-version-check", "check"], capture_output=True, text=True, timeout=request.get("timeout", 60), check=False)
     imports = []
@@ -159,6 +161,7 @@ def observe_environment(root, request):
         "pip_check": {"passed": checked.returncode == 0, "exit_code": checked.returncode, "output": (checked.stdout + checked.stderr)[-8000:]},
         "imports": imports,
         "dependencies": dependencies,
+        "readiness_dependencies": readiness_dependencies,
     }
 
 
