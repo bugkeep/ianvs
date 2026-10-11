@@ -35,6 +35,50 @@ class HarnessTaskTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.harness.close()
 
+    async def test_original_goal_is_reloaded_for_context_and_readable_after_restart(self):
+        self.harness._ensure_task("修复当前 Example，保留原始目标", kind="repair")
+        acceptance = copy.deepcopy(self.harness.task["acceptance"])
+        binding = copy.deepcopy(self.harness.task["original_goal"])
+        instance = self.harness.current_instance
+        goal = self.harness.store.read(binding["evidence_ref"])
+        self.assertEqual(goal["status"], "complete", goal["unresolved"])
+        path = Path(instance["code_root"]) / goal["documents"]["testenv"]["path"]
+        path.write_text("testenv:\n  metrics: []\n", encoding="utf-8")
+        self.harness._bind_original_goal()
+        self.assertEqual(self.harness.task["original_goal"], binding)
+        self.assertEqual(self.harness.task["acceptance"], acceptance)
+        await self.harness._save_session_async()
+        identity = instance["instance_id"]
+        settings = self.harness.settings
+        await self.harness.close()
+        self.harness = AgentHarness(settings)
+        self.harness.select_instance(identity)
+        self.assertEqual(self.harness.task["original_goal"], binding)
+        self.assertEqual(self.harness.task["acceptance"], acceptance)
+        messages = self.harness.context._pinned(self.harness.task, self.harness.state, "observe")
+        pinned = next(message for message in messages if message["content"].startswith("程序读取的原目标与创建来源"))
+        source = json.loads(pinned["content"].split("\n", 1)[1])
+        self.assertEqual(source["requirements"], goal["requirements"])
+        self.assertEqual(source["evidence_ref"], binding["evidence_ref"])
+        result = await self.harness.tools.execute({"id": "read-original-goal", "name": "read_evidence", "arguments": {"reference": binding["evidence_ref"], "end_line": 2000}})
+        self.assertEqual(result["status"], "success", result)
+        full = self.harness.store.read(result["full_output_ref"]) if result["truncated"] else result["data"]
+        self.assertIn(goal["goal_id"], full["content"])
+        self.harness._update_observation({"facts": [{"value": "原目标来自创建来源记录", "evidence_ref": binding["evidence_ref"]}], "hypotheses": []})
+        self.assertEqual(self.harness.state["facts"][-1]["evidence_ref"], binding["evidence_ref"])
+        self.assertEqual(self.harness.usage_summary()["model_calls"], 0)
+
+    async def test_runner_rejects_different_task_goal_before_execution(self):
+        self.harness._ensure_task("运行当前 Example", kind="run")
+        binding = {**self.harness.task["original_goal"], "goal_id": "different-goal"}
+        with self.assertRaisesRegex(ValueError, "原目标版本"):
+            await self.harness.runner.run(self.harness.current_instance, original_goal=binding)
+        instance = self.harness.instances.get(self.harness.current_instance["instance_id"])
+        run = self.harness.runner.get_run(instance["instance_id"], instance["last_run_id"])
+        self.assertEqual(run["status"], "failed")
+        self.assertIsNone(run["pid"])
+        self.assertIsNone(run["source_manifest"])
+
     async def test_failed_run_starts_repair_with_user_goal_and_frozen_acceptance(self):
         self.harness._ensure_task("运行当前 Example", kind="run")
         self.harness.task["acceptance"]["metric_thresholds"] = {"acc": {"min": 1.0}}

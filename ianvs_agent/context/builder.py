@@ -14,6 +14,7 @@ from ianvs_agent.llm.provider import ContextLimitError
 from ianvs_agent.llm.usage import BudgetExceededError
 from ianvs_agent.message_types import tool_evidence_references
 from ianvs_agent.runtime.environment import environment_summary
+from ianvs_agent.runtime.goal_checks import goal_summary
 
 
 class ContextManager:
@@ -129,6 +130,9 @@ class ContextManager:
             if instance:
                 reference = f"instances/{instance_id}/instance.json"
                 messages.append({"role": "user", "content": "程序读取的当前实例运行环境，以此正式记录为准；历史 Run 的 environment_id、旧工具结果和摘要只反映当时情况，不能覆盖当前环境。ready 表示声明的环境步骤已完成，模型、数据与原任务成功仍需独立核验：\n" + json.dumps({"instance_id": instance_id, "environment": environment_summary(environment), "evidence_ref": reference}, ensure_ascii=False)})
+                goal_reference = instance.get("original_goal_ref")
+                goal = self.store.read(goal_reference) if goal_reference else None
+                messages.append({"role": "user", "content": "程序读取的原目标与创建来源。当前配置修改和历史压缩摘要不能重定义这些要求；来源未确认时可以继续调查和修复，但不能宣称原任务已通过。完整来源与恢复依据见 evidence_ref：\n" + json.dumps(goal_summary(goal), ensure_ascii=False)})
         if role == "observe":
             return messages
         path = self.readmes.locate(task, state, self.settings.project_root)
@@ -164,6 +168,9 @@ class ContextManager:
                 reference = f"instances/{task['instance_id']}/instance.json"
                 if self.store.path(reference).is_file():
                     references.add(reference)
+                    goal_reference = self.store.read(reference, {}).get("original_goal_ref")
+                    if goal_reference:
+                        references.add(goal_reference)
             records = [json.loads(message["content"]) for message in current_history if message.get("role") == "tool"]
             for record in records:
                 if record.get("operation_id"):

@@ -30,6 +30,7 @@
 - history 是 OpenAI 格式消息列表；切分保留 tool_calls 与对应结果完整配对。正式 task/state 的发送视图始终重新注入，压缩历史摘要不覆盖正式记录。
 - STATE 视图选取最早五项、最近十五项 facts 以及最近十项 hypotheses，其他程序字段完整保留。TASK 的 `acceptance.file_identities` 超过二十四项时选取最早八项及 `repair_progress.files_read` 中已有路径；其他任务与验收字段完整保留。视图附 `context_selection` 数量与全文引用；全文保存于会话 `tool-output/STATE-<task_id>.json` 和 `TASK-<task_id>.json`。选择范围不调用模型或产生压缩记录，Checkpoint 仍保存完整输入 task/state；全部身份约束继续交给独立 Verifier 核对。
 - 每次请求从当前 `instance.json` 重新读取环境摘要，包含环境身份、完成时间、解释器、包数量、准备步骤及证据。历史 Run 的环境字段只表示当时的执行条件。
+- 每次请求通过实例的 `original_goal_ref` 重新读取正式目标的 `requirements,status,unresolved,supported_checks,limitations`。未确认项展示前二十项、数量与全文引用；目标声明完整保留。Observe 可以引用该来源记录；摘要不参与更新目标版本。
 - Plan 可调用工具；Observe 不开放工具，返回 facts/hypotheses/next_goal/decision 的 JSON。权限、patch、Run 与 verification 状态由程序更新。
 - Observe 的标准 JSON 解析或字段检查失败后，保存 `observation.failed` 及原始请求引用，最多追加一次 `retry_reason=observation_format,max_attempts=1` 的格式纠正请求。纠正用量与活动时间累计记入原任务统计，已完成工具不重复执行；合法响应通过检查后才更新调查事实，第二次格式失败明确停止。
 
@@ -37,19 +38,25 @@
 
 - `ExampleCatalog(project_root).list_examples() -> list[dict]`：`benchmark_path,name,readme_path,inventory_entry`。
 - `InstanceManager(settings,store,events)`：`create(benchmark_path,name=None) -> dict`；`list_instances()`；`get(instance_id)`；`check_changes(instance_id)`；记录 `code_root,benchmark_path,readme_path,environment,status,verification`。
+- `OriginalGoalStore(settings,store)`：`capture(instance)` 保存创建文件原字节与只写一次的 manifest，`resolve(instance)` 恢复或补充来源版本，`load(instance,reference=None)` 核查记录摘要、实例身份、创建 manifest 和绑定对象的内容摘要。对象放在 `original-goals/objects/`，实例 manifest 和目标版本放在 `instances/<id>/original-goals/`，均位于可修改的 `code/` 之外；同内容去重，工作文件不与对象共享可修改字节。
+- 自动来源恢复只接受同 Example、完整 `testenv/` 或 `testalgorithms/` 后缀、唯一创建候选、字节与创建 SHA256 相同。算法模块 URL 只绑定来源，允许修改其源码实现；顶层指标及 `model_eval.model_metric` 的实现保持创建摘要，最终 Rank 指标取自顶层声明。本地模型与数据的文件及目录成员另存 `artifact_bindings`。旧实例按当前实例文件、原目录文件、初始 `task_spec`、补丁 before 与 Run 配置文本核对原字节。多个候选、字节缺失、原任务冲突或未支持结构保存 `needs_binding/source_missing/unsupported`，不使用当前修改内容替代原版本。
+- 目标版本保存 `goal_id,goal_digest,evidence_ref,source_manifest_ref,source_manifest_digest,documents,bindings,requirements,metric_sources,artifact_bindings,unresolved,supported_checks,limitations`。补充版本保留 previous 引用；内容未变不创建新版本。原 `task_spec` 和 `acceptance` 不改写；任务单独保存 `original_goal` 与 `goal_binding_history`，实例保存 `original_goal_ref,goal_id,goal_digest`。补充来源使已有验证失效，Run 只能在新执行时登记目标版本。
 - `check_changes()` 的包清单检查与 Verifier 共用 `runtime_environment()`，清除控制进程的 `PYTHONPATH/PYTHONHOME` 后使用实例解释器，按正式包名称和版本核对环境变化。
 - `EnvironmentManager(settings,store,events)`；`async prepare(instance,install=True,plan_id=None) -> dict`；实例独立 venv，解释器实际完整路径，原有准备脚本按声明执行。`preview_prepare(instance)` 生成稳定准备计划，`revalidate(instance,plan_id)` 核查实例、环境代次和输入文件版本。
+- `prepare` 创建候选 venv 前，在只读快照中使用控制解释器的 pip 解析准备命令直接使用的 requirements、constraints 与 packages，关闭网络。计划保存 `dependencies,requirements_file_versions,parse_operation_ref,parse_result_ref`；解析失败保持 `status=invalid` 并返回计划与日志引用，取消保持 `status=cancelled`。解析成功后重新核对当前文件和快照版本，再执行安装。该阶段不改原环境或验证状态，脚本内部动态输入继续由实际脚本执行及后续检查负责。
+- 安装计划同时保存 `source_directories`，快照保留符合源码忽略规则的空目录。审批、解析、安装与激活阶段均核对当前源码和快照的文件版本及目录集合；目录增删、符号链接替换或旧计划缺少目录依据时需要重新计划和审批。
 - `async inspect(instance,requirements_files=None,modules=None)` 保存真实解释器、包版本、pip check、模块导入及依赖文件版本。`async plan_install(instance,requirements_files=None,packages=None,constraints_files=None,index_url=None,timeout=1800,modules=None)` 保存安装输入、计划与审批依据；`async install(instance,plan_id)` 创建候选环境，执行安装及检查后激活，返回 `postcheck`。`recover(instance)` 核查所属进程和中断记录，`async cancel(instance=None)` 终止所属操作。
 - `EnvironmentCommands(settings,store,events)`；`preview(instance,argv,cwd=".",timeout=300,writable_directories=None,network=False)` 返回具体审批内容；`async execute(...,approved=None)` 核查审批内容并执行，保存独立命令记录。源码和现有环境只读，生成目录及网络权限显式审批。
 - 环境辅助执行使用 Linux Bubblewrap。依赖解析使用目标解释器的 pip，保存递归 requirements/constraints 与本地依赖制品版本；控制程序正式记录不挂载为可写目录。
 - pip 在真实解析阶段保存 `resolution_ref,constraints_ref`，审批绑定解析结果及制品版本。候选环境仅在安装与检查通过后激活；原环境处于 `ready` 或 `modified` 时，候选失败、取消或中断均保留原环境身份和异常状态。预检、进程启动和命令执行通过 `phase,command_executed,exit_code` 区分，失败保存正式日志引用。
 - 依赖计划保存 `pip_cache_dir,pip_cache_ref`，pip 解析与安装显式绑定当前实例缓存，审批包括实际 `--cache-dir` 命令。依赖声明的 loopback HTTP `find-links` 可登记确切主机及端口的 `--trusted-host`，记录在 `cache_trusted_hosts`；其他 HTTP 来源不会自动扩展信任。旧 prepare 计划缺少缓存依据时保留原命令并失效，新计划重新审批。
 - Environment 保存 `summary,warnings,preparation_scope,steps,failed_step`。准备步骤发送 `environment.step_started/completed/failed`，失败保留 `error_tail,log_ref`；复用环境补充说明时保持已有验证判定。
-- `Runner(settings,store,events)`；`async run(instance,overrides=None) -> dict`；`async cancel()`；`get_run(instance_id,run_id)`；绑定独立 cwd/解释器/workspace，事件通道区别于 stdout/stderr。
+- `Runner(settings,store,events)`；`async run(instance,overrides=None,*,original_goal=None) -> dict`；`async cancel()`；`get_run(instance_id,run_id)`；绑定独立 cwd/解释器/workspace，事件通道区别于 stdout/stderr。
 - 若子进程在采集创建时间之前已结束，`process_created_at` 保持 null，继续读取真实退出码和 stdout/stderr；恢复时不把缺少身份的 PID 判为所属活动进程。
 - 新 Run 启动前若仍缓存重启前的所属进程，重新核查 PID、创建时间与所属身份；存活时保持运行互斥，已退出时将旧 Run 保存为 interrupted、退出码保持未知，允许启动新 Run。
 - Run 保存 `run_id,instance_id,environment_id,status,exit_code,timed_out,interrupted,started_at,completed_at,command,cwd,output_dir,stdout_ref,stderr_ref,events,testcases,metrics,artifacts,config_snapshot`，未知字段为 null。`execution_configuration` 保存入口和实际启动环境中的 `mock_runtime_enabled,pythonpath_override`，来源类型为 `runner_launch_environment`；该字段说明启动配置，模型正确性仍由执行与独立检查证据判断。
-- `Verifier(settings,store,events)`；`async verify(instance,run,acceptance=None) -> dict`；`async validate(instance) -> dict`。判定 `passed,execution_completed,results_complete,checks_passed,goal_achieved,repair_completed,checks,reasons,evidence_type`；必需检查 SKIP、旧 CSV、缺失本轮指标不能通过。
+- `Runner.run(instance,overrides=None,*,original_goal=None)` 启动前登记 `original_goal_ref,goal_id,goal_digest`。Harness 传入已保存的任务来源绑定时只核查并使用该版本；直接调用 Runner 时先恢复来源。任务绑定与实例不一致时不启动评测进程。
+- `Verifier(settings,store,events)`；`async verify(instance,run,acceptance=None,original_goal=None) -> dict`；`async validate(instance) -> dict`。判定 `passed,execution_completed,results_complete,checks_passed,goal_achieved,repair_completed,checks,reasons,evidence_type`；必需检查 SKIP、旧 CSV、缺失本轮指标不能通过。来源记录必须完整且任务、实例、Run 版本一致，`required_metrics` 仅增加指标要求。报告另存 `goal_source_status,unresolved_goal_sources,goal_check_limitations,task_original_goal`；原验收保持完整。
 - `validate()` 的检查附 `source_kind=static_validation` 及本次 `report.json` 引用；通过该来源明确区分静态检查材料与实际 Run。验证条件保持独立。
 - `validate()` 使用 Agent 控制解释器，允许检查尚未准备或依赖异常的实例。`verify()` 另外检查真实目标环境的 `pip check`、当前与本次 Run 的准备状态；静态检查通过不能代替原任务和环境通过。
 - core 增加可选轻量事件回调，普通 CLI 保持兼容；`--agent` 延迟导入 TUI，且与 `-f` 互斥。

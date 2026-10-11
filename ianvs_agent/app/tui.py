@@ -970,6 +970,8 @@ class IanvsAgentApp(App):
 
     @on(TabbedContent.TabActivated, "#main-tabs")
     def refresh_activated_view(self, event: TabbedContent.TabActivated):
+        for log in event.pane.query(ReflowRichLog):
+            log.call_after_refresh(log.reflow)
         if event.pane.id == "diff":
             self.action_show_diff()
         elif event.pane.id == "usage":
@@ -1036,6 +1038,11 @@ class IanvsAgentApp(App):
                     lines.append(f"本轮执行入口：{launch.get('entrypoint', '未知')}")
                     enabled = launch.get("mock_runtime_enabled")
                     lines.append("Mock 运行开关：" + ("已启用" if enabled is True else "未启用" if enabled is False else "未知"))
+            if report.get("original_goal_ref"):
+                lines.extend(["", f"原目标版本：{report.get('goal_id', '未知')}", f"原目标来源：{report['original_goal_ref']}"])
+                for source in report.get("unresolved_goal_sources", []):
+                    lines.append(f"来源待确认：{source.get('field', '')} · {source.get('reason', '')}")
+                lines.extend(str(item) for item in report.get("goal_check_limitations", []))
             lines.extend(["", "判定依据"])
             lines.extend(str(reason) for reason in report.get("reasons", []))
             for check in report.get("checks", []):

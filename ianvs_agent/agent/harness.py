@@ -17,6 +17,7 @@ from ianvs_agent.llm.provider import Provider
 from ianvs_agent.llm.usage import UsageTracker
 from ianvs_agent.message_types import format_task_result, observation_statement, tool_evidence_references
 from ianvs_agent.runtime import ExampleCatalog, EnvironmentManager, InstanceManager, Runner, Verifier
+from ianvs_agent.runtime.original_goal import OriginalGoalStore
 from ianvs_agent.storage.local_store import LocalStore
 from ianvs_agent.tools.filesystem import register_tools
 from ianvs_agent.tools.registry import ToolRegistry
@@ -36,6 +37,7 @@ class AgentHarness:
         self.events = EventBus(self.store)
         self.catalog = ExampleCatalog(settings.project_root)
         self.instances = InstanceManager(settings, self.store, self.events)
+        self.original_goals = OriginalGoalStore(settings, self.store)
         self.environment = EnvironmentManager(settings, self.store, self.events)
         self.runner = Runner(settings, self.store, self.events)
         self.verifier = Verifier(settings, self.store, self.events)
@@ -74,6 +76,7 @@ class AgentHarness:
 
     def _select_instance(self, instance_id):
         self.current_instance = self.instances.get(instance_id)
+        self.original_goals.resolve(self.current_instance)
         pointer = self.store.read(f"instances/{instance_id}/latest_session.json", {})
         if pointer:
             self.session_relative_path = pointer["path"]
@@ -99,6 +102,7 @@ class AgentHarness:
             self.session = {"schema_version": 1, "session_id": session_id, "instance_id": instance_id, "created_at": now(), "model_profile": self.settings.selected_profile}
             self.task, self.state, self._messages = {}, {}, []
             self.store.write(f"instances/{instance_id}/latest_session.json", {"path": self.session_relative_path})
+        self._bind_original_goal(resolve=False)
         self.events.bind(instance_id=instance_id, session_id=self.session["session_id"], task_id=self.task.get("task_id"), environment_id=(self.current_instance.get("environment") or {}).get("environment_id"), run_id=None)
         self._connect_provider()
         self._save_session()
@@ -168,6 +172,26 @@ class AgentHarness:
             self.events.bind(environment_id=(self.current_instance.get("environment") or {}).get("environment_id"))
             await self._save_session_async()
 
+    def _bind_original_goal(self, resolve=True):
+        self.current_instance = self.instances.get(self.current_instance["instance_id"])
+        if resolve:
+            self.original_goals.resolve(self.current_instance)
+        if not self.task:
+            return
+        reference = self.current_instance["original_goal_ref"]
+        record = self.store.read(reference)
+        binding = {"goal_id": record["goal_id"], "goal_digest": record["goal_digest"], "evidence_ref": reference, "status": record["status"]}
+        previous = self.task.get("original_goal")
+        if previous == binding:
+            return
+        if previous:
+            original = self.original_goals.load(self.current_instance, previous["evidence_ref"])
+            if original["source_manifest_digest"] != record["source_manifest_digest"]:
+                raise ValueError("任务的创建来源已经变化，需要明确新的任务目标")
+            self.task.setdefault("goal_binding_history", []).append(previous)
+        self.task["original_goal"] = binding
+        self.state["verification"] = self.current_instance.get("verification") or {}
+
     def _ensure_task(self, goal, kind="conversation"):
         status = self.state.get("status")
         finished_conversation = self.task.get("kind") in {"conversation", "maintenance"} and status in {"completed", "cancelled", "failed", "blocked", "interrupted"}
@@ -190,6 +214,7 @@ class AgentHarness:
                 if run["status"] == "failed":
                     self.state["failure"] = self._failure_summary(run)
         self.state["verification"] = self.current_instance.get("verification") or {}
+        self._bind_original_goal(resolve=False)
         self.events.bind(task_id=task_id)
         self._save_session()
 
@@ -233,9 +258,10 @@ class AgentHarness:
         return {"run_id": run["run_id"], "status": run["status"], "exit_code": run.get("exit_code"), "evidence": evidence}
 
     async def _run(self):
+        await self._run_sync(self._bind_original_goal)
         self.state["repair_attempts"] = self.state.get("repair_attempts", 0) + 1
         await self._save_session_async()
-        run = await self.runner.run(self.current_instance)
+        run = await self.runner.run(self.current_instance, original_goal=self.task.get("original_goal"))
         self.current_instance = self.instances.get(self.current_instance["instance_id"])
         self.state["last_run_id"] = run["run_id"]
         self.state["last_run"] = self.run_summary(run)
@@ -246,7 +272,7 @@ class AgentHarness:
             raise asyncio.CancelledError
         if run["status"] != "completed":
             self.state["failure"] = self._failure_summary(run)
-        verification = await self.verifier.verify(self.current_instance, run, self.task.get("acceptance"))
+        verification = await self.verifier.verify(self.current_instance, run, self.task.get("acceptance"), self.task.get("original_goal"))
         self.state["verification"] = verification
         self.current_instance = self.instances.get(self.current_instance["instance_id"])
         await self._save_session_async()
@@ -309,6 +335,7 @@ class AgentHarness:
         return self.task.get("kind") != "conversation" or any(not self.tools.is_read_only(call["name"], call.get("arguments")) for call in calls)
 
     async def _loop(self):
+        await self._run_sync(self._bind_original_goal)
         self.state["status"] = "running"
         self.state.pop("error", None)
         self.state.pop("result", None)
@@ -541,6 +568,9 @@ class AgentHarness:
         instance_reference = f"instances/{self.current_instance['instance_id']}/instance.json"
         if self.store.path(instance_reference).is_file():
             references.add(instance_reference)
+            goal_reference = self.store.read(instance_reference, {}).get("original_goal_ref")
+            if goal_reference:
+                references.add(goal_reference)
         for record in records:
             if record.get("full_output_ref"):
                 references.add(record["full_output_ref"])

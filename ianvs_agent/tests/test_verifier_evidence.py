@@ -30,6 +30,7 @@ class RealRunVerifierTests(unittest.IsolatedAsyncioTestCase):
     def setUpClass(cls):
         cls.project = Path(__file__).resolve().parents[2]
         original = LocalStore(Path(os.environ["IANVS_RUNTIME_EVIDENCE_ROOT"]))
+        cls.original_store = original
         instance_id = os.environ.get("IANVS_RUNTIME_EVIDENCE_INSTANCE", "instance-0001")
         run_id = os.environ.get("IANVS_RUNTIME_EVIDENCE_RUN", "run-0002")
         cls.original_instance = original.read(f"instances/{instance_id}/instance.json")
@@ -39,6 +40,8 @@ class RealRunVerifierTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("真实实例或 Run 证据不存在")
         if cls.original_run["status"] != "completed" or cls.original_run["exit_code"] != 0:
             raise RuntimeError("该组回归需要正常完成的真实基线 Run")
+        if not cls.original_run.get("original_goal_ref"):
+            raise RuntimeError("该组回归需要原目标版本登记后新执行的真实 Run；不能为历史运行补写目标身份")
         cls.control = LocalStore(Path(os.environ.get("IANVS_VERIFIER_TEST_ROOT", cls.project / "workspace/verifier-evidence-tests")))
 
     async def asyncSetUp(self):
@@ -68,6 +71,16 @@ class RealRunVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.instance["verification"] = None
         self.instance["last_run_id"] = self.run["run_id"]
         self.instance["environment"] = copy.deepcopy(self.run["environment_snapshot"])
+        goal_directory = f"instances/{self.instance['instance_id']}/original-goals"
+        for source in self.original_store.path(goal_directory).rglob("*.json"):
+            relative = source.relative_to(self.original_store.root).as_posix()
+            self.store.write(relative, self.original_store.read(relative))
+        goal = self.store.read(self.instance["original_goal_ref"])
+        for item in [*goal["bindings"], *goal["artifact_bindings"]]:
+            reference = item["object_ref"]
+            destination = self.store.path(reference)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.original_store.path(reference), destination)
         original_output = Path(self.original_run["output_dir"])
         output = instance_root / f"runs/{self.run['run_id']}/output"
         shutil.copytree(original_output, output)
@@ -238,6 +251,21 @@ class RealRunVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checks["原始算法目标与配置来源保持一致"], "FAIL")
         self.assertFalse(result["passed"])
 
+    async def test_same_content_testenv_at_new_source_path_is_rejected(self):
+        root = Path(self.instance["code_root"])
+        benchmark_path = root / self.instance["benchmark_path"]
+        benchmark = yaml.safe_load(benchmark_path.read_text(encoding="utf-8"))
+        original = root / benchmark["benchmarkingjob"]["testenv"]
+        alternate = original.with_name("alternate_testenv.yaml")
+        shutil.copy2(original, alternate)
+        benchmark["benchmarkingjob"]["testenv"] = alternate.relative_to(root).as_posix()
+        benchmark_path.write_text(yaml.safe_dump(benchmark), encoding="utf-8")
+        result = await self.verifier.verify(self.instance, self.run)
+        checks = {item["name"]: item["status"] for item in result["checks"]}
+        self.assertEqual(checks["原始测试环境参数保持一致"], "PASS")
+        self.assertEqual(checks["原始测试环境配置来源保持一致"], "FAIL")
+        self.assertFalse(result["passed"])
+
     async def test_replaced_frozen_dataset_source_is_rejected(self):
         root = Path(self.instance["code_root"])
         testenv_path = root / "examples/llm_simple_qa/testenv/testenv.yaml"
@@ -272,7 +300,7 @@ class RealRunVerifierTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(checks[name], "PASS")
         self.assertFalse(result["passed"], "改变源码后必须新 Run，路径等效不能替代重新执行")
 
-    async def test_missing_original_paths_allow_repair_with_frozen_baseline(self):
+    async def test_conflicting_original_task_cannot_redefine_frozen_baseline(self):
         benchmark = yaml.safe_load(self.instance["task_spec"]["benchmark_text"])
         benchmark["benchmarkingjob"]["test_object"]["algorithms"][0]["url"] = "examples/llm_simple_qa/missing-algorithm.yaml"
         testenv = yaml.safe_load(self.instance["task_spec"]["testenv_text"])
@@ -282,9 +310,42 @@ class RealRunVerifierTests(unittest.IsolatedAsyncioTestCase):
         self._save()
         acceptance = {"metric_thresholds": {"acc": {"min": 1.0}}, "file_identities": {name: value for name, value in self.original_run["source_manifest"].items() if name.startswith(("examples/llm_simple_qa/", "dataset/"))}}
         frozen = copy.deepcopy(acceptance)
+        with self.assertRaises(ValueError):
+            await self.verifier.verify(self.instance, self.run, acceptance)
+        self.assertEqual(acceptance, frozen)
+
+    async def test_old_run_without_goal_identity_requires_fresh_execution(self):
+        for key in ("original_goal_ref", "goal_id", "goal_digest"):
+            self.run.pop(key)
+        self._save()
+        result = await self.verifier.verify(self.instance, self.run)
+        self.assertTrue(result["execution_completed"])
+        self.assertTrue(result["results_complete"])
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("原目标版本" in reason for reason in result["reasons"]))
+
+    async def test_required_metrics_cannot_replace_missing_original_goal(self):
+        for key in ("original_goal_ref", "goal_id", "goal_digest"):
+            self.instance.pop(key)
+        self._save()
+        acceptance = {"required_metrics": ["acc"]}
         result = await self.verifier.verify(self.instance, self.run, acceptance)
-        self.assertTrue(result["passed"], result["reasons"])
+        self.assertTrue(result["execution_completed"])
+        self.assertTrue(result["results_complete"])
+        self.assertFalse(result["checks_passed"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["acceptance"], acceptance)
+
+    async def test_task_goal_binding_mismatch_cannot_pass(self):
+        binding = {"evidence_ref": self.instance["original_goal_ref"], "goal_id": "different-goal", "goal_digest": self.instance["goal_digest"]}
+        acceptance = self._acceptance(-1)
+        frozen = copy.deepcopy(acceptance)
+        result = await self.verifier.verify(self.instance, self.run, acceptance, binding)
+        self.assertTrue(result["execution_completed"])
+        self.assertTrue(result["results_complete"])
+        self.assertFalse(result["passed"])
         self.assertEqual(result["acceptance"], frozen)
+        self.assertEqual(result["task_original_goal"], binding)
 
     async def test_new_cancelled_run_invalidates_old_passed_verification(self):
         previous = await self.verifier.verify(self.instance, self.run)

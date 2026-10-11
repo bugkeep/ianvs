@@ -15,7 +15,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 
 from .dependencies import check_url, source_path
-from .instances import configuration_evidence, file_manifest, source_files, utc_now, validate_identity
+from .instances import IGNORED_DIRECTORIES, configuration_evidence, file_manifest, source_files, utc_now, validate_identity
 from .packages import package_identity
 from .processes import recorded_process, sandboxed_command, terminate_recorded_operation
 
@@ -229,6 +229,15 @@ class EnvironmentManager:
             self.store.write(reference, check)
             self.events.emit("environment.inspected", check, instance_id=instance["instance_id"], environment_id=check["environment_id"])
 
+    @staticmethod
+    def _source_directories(root):
+        root = Path(root)
+        result = []
+        for directory, folders, _ in os.walk(root):
+            folders[:] = sorted(name for name in folders if name not in IGNORED_DIRECTORIES and not (Path(directory) / name).is_symlink())
+            result.extend((Path(directory) / name).relative_to(root).as_posix() for name in folders)
+        return sorted(result)
+
     def _new_plan(self, instance, action, request, timeout):
         existing = instance.get("environment") or {}
         root = Path(instance["code_root"]).resolve()
@@ -238,6 +247,9 @@ class EnvironmentManager:
         directory = self.store.path(reference).with_suffix("")
         snapshot = directory / "input-snapshot"
         snapshot.mkdir(parents=True)
+        directories = self._source_directories(root)
+        for name in directories:
+            (snapshot / name).mkdir(parents=True, exist_ok=True)
         versions = {}
         for path in source_files(root):
             relative = path.relative_to(root)
@@ -245,7 +257,7 @@ class EnvironmentManager:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, destination)
             versions[relative.as_posix()] = hashlib.sha256(destination.read_bytes()).hexdigest()
-        if file_manifest(root) != versions:
+        if file_manifest(root) != versions or self._source_directories(root) != directories:
             raise RuntimeError("复制依赖计划期间实例文件发生变化，请重新生成计划")
         venv = self.settings.state_root / f"environments/{environment_id}/venv"
         python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -260,7 +272,7 @@ class EnvironmentManager:
         if request.get("index_url"):
             command.extend(["--index-url", request["index_url"]])
         plan = {"schema_version": 1, "plan_id": plan_id, "action": action, "instance_id": instance["instance_id"], "task_id": self.events.identities.get("task_id"), "status": "planned", "requires_install": True, "created_at": utc_now(), "evidence_ref": reference, "code_root": str(root), "base_environment_id": existing.get("environment_id"), "base_generation": existing.get("generation", 0), "candidate_environment_id": environment_id, "candidate_generation": existing.get("generation", 0) + 1, "base_python": self.settings.python_executable, "python_executable": str(python), "venv_root": str(venv), "snapshot_root": str(snapshot), "file_versions": versions, "snapshot_fingerprint": self._fingerprint(versions), "request": request, "timeout": timeout, "commands": [{"command": [self.settings.python_executable, "-m", "venv", str(venv)], "cwd": str(root), "network": False}, {"command": command, "cwd": str(root), "network": True}], "dependency_fingerprint": self._fingerprint({"request": request, "file_versions": versions})}
-        plan.update(pip_cache_dir=str(self._pip_cache(instance)), pip_cache_ref=f"instances/{instance['instance_id']}/pip-cache")
+        plan.update(source_directories=directories, snapshot_fingerprint=self._fingerprint({"file_versions": versions, "source_directories": directories}), pip_cache_dir=str(self._pip_cache(instance)), pip_cache_ref=f"instances/{instance['instance_id']}/pip-cache")
         self.store.write(reference, plan)
         if action == "install":
             plan["status"] = "planning"
@@ -269,20 +281,38 @@ class EnvironmentManager:
             self.store.write(f"instances/{instance['instance_id']}/instance.json", instance)
         return plan
 
+    def _prepare_request(self, instance):
+        root = Path(instance["code_root"])
+        entry = instance.get("inventory_entry") or {}
+        preparation = entry.get("prepare_env") or {}
+        specification = (instance.get("environment") or {}).get("dependency_spec") or {}
+        requirements = ["requirements.txt", *specification.get("requirements_files", [])]
+        declared = entry.get("requirements_file")
+        if declared and not any(item.get("type") == "dependency" for item in preparation.get("steps", [])):
+            requirements.append(declared)
+        return self._request(instance, requirements_files=requirements, packages=[*specification.get("packages", []), str(root / "resources/third_party/sedna-0.6.0.1-py3-none-any.whl")], constraints_files=specification.get("constraints_files", []), modules=specification.get("modules", []))
+
+    def _prepare_parse_error(self, plan):
+        operation = plan.get("parse_operation") or self.store.read(plan.get("parse_operation_ref"), {})
+        log = operation.get("log_ref")
+        return f"{plan['error']}；{self._log_tail(log)}；plan_id={plan['plan_id']}；evidence_ref={plan['evidence_ref']}；log_ref={log}"
+
     def preview_prepare(self, instance):
+        request = self._prepare_request(instance)
+        preparation = (instance.get("inventory_entry") or {}).get("prepare_env") or {}
         cached = instance.get("prepare_plan_id")
         if cached:
             plan = self.store.read(self._reference(instance, "environment-plans", cached))
             if plan and plan["status"] == "planned" and ("pip_cache_dir" not in plan or "pip_cache_ref" not in plan):
                 plan.update(status="invalid", invalidated_at=utc_now(), error="环境准备需要重新生成包含实例缓存目录的计划并审批")
                 self.store.write(plan["evidence_ref"], plan)
-            if plan and plan["status"] == "planned" and plan["file_versions"] == file_manifest(instance["code_root"]) and plan["base_environment_id"] == (instance.get("environment") or {}).get("environment_id"):
+            same_inputs = plan and plan.get("request") == request and plan.get("preparation") == preparation and plan["file_versions"] == file_manifest(instance["code_root"]) and plan.get("source_directories") == self._source_directories(instance["code_root"]) and plan["base_environment_id"] == (instance.get("environment") or {}).get("environment_id") and plan["base_generation"] == (instance.get("environment") or {}).get("generation", 0) and plan["base_python"] == self.settings.python_executable
+            if same_inputs and plan["status"] == "planned":
                 return self.revalidate(instance, cached)
-        request = self._request(instance)
         plan = self._new_plan(instance, "prepare", request, 1800)
         root, python = Path(instance["code_root"]), plan["python_executable"]
         plan["commands"][1]["command"] = self._cached_install(instance, [python, "-m", "pip", "install", "-r", str(root / "requirements.txt"), str(root / "resources/third_party/sedna-0.6.0.1-py3-none-any.whl")])
-        preparation = (instance.get("inventory_entry") or {}).get("prepare_env") or {}
+        plan["preparation"] = copy.deepcopy(preparation)
         declared = (instance.get("inventory_entry") or {}).get("requirements_file")
         if declared and not any(item.get("type") == "dependency" for item in preparation.get("steps", [])):
             plan["commands"].append({"command": self._cached_install(instance, [python, "-m", "pip", "install", "-r", str(root / declared)]), "cwd": str(root), "network": True})
@@ -301,6 +331,55 @@ class EnvironmentManager:
         self.store.write(f"instances/{instance['instance_id']}/instance.json", instance)
         return plan
 
+    async def _preflight_prepare(self, instance, plan):
+        if plan is None:
+            staging = asyncio.create_task(asyncio.to_thread(self.preview_prepare, instance))
+            try:
+                plan = await asyncio.shield(staging)
+            except asyncio.CancelledError:
+                plan = await staging
+                plan.update(status="cancelled", completed_at=utc_now(), error="环境准备计划快照已取消")
+                await asyncio.to_thread(self.store.write, plan["evidence_ref"], plan)
+                raise
+        directory = self.store.path(plan["evidence_ref"]).with_suffix("")
+        mappings = [{"source": plan["snapshot_root"], "destination": plan["code_root"]}]
+        plan.update(status="planning", parse_operation_ref=(directory / "parse/operation.json").relative_to(self.store.root).as_posix(), parse_result_ref=(directory / "parse/worker-output/observation.json").relative_to(self.store.root).as_posix())
+        self.store.write(plan["evidence_ref"], plan)
+        instance["environment_operation_ref"] = plan["evidence_ref"]
+        self.store.write(f"instances/{instance['instance_id']}/instance.json", instance)
+        try:
+            preparation = (instance.get("inventory_entry") or {}).get("prepare_env") or {}
+            if plan["request"] != self._prepare_request(instance) or plan.get("preparation") != preparation:
+                raise ValueError("准备计划的依赖声明已经变化，请重新生成计划")
+            parsed, operation = await self._worker(instance, self.settings.python_executable, plan["request"], directory / "parse", "dependencies", mappings)
+            plan.update(dependencies=parsed, parse_operation=operation, requirements_file_versions=parsed["file_versions"])
+            if not parsed["passed"]:
+                raise ValueError("依赖声明无法解析：" + json.dumps(parsed["errors"][:3], ensure_ascii=False)[:1000])
+            if any(plan["file_versions"].get(name) != version for name, version in parsed["file_versions"].items()):
+                raise RuntimeError("依赖解析结果与准备计划快照版本不同")
+            await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
+            plan.update(status="planned", parsed_at=utc_now())
+            return plan
+        except (Exception, asyncio.CancelledError) as error:
+            plan.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "invalid", error=str(error) or "环境准备依赖解析已取消", completed_at=utc_now())
+            if isinstance(error, (PermissionError, ValueError, RuntimeError, TimeoutError)):
+                raise type(error)(self._prepare_parse_error(plan)) from error
+            raise
+        finally:
+            self.store.write(plan["evidence_ref"], plan)
+
+    def _validate_plan_inputs(self, instance, plan):
+        if plan["file_versions"] != file_manifest(instance["code_root"]):
+            raise ValueError("依赖计划批准的文件版本已经变化，请重新生成计划")
+        if plan["file_versions"] != file_manifest(plan["snapshot_root"]):
+            raise RuntimeError("依赖计划输入快照发生变化")
+        if "source_directories" not in plan:
+            raise ValueError("依赖计划缺少目录版本记录，请重新生成计划")
+        if plan["source_directories"] != self._source_directories(instance["code_root"]):
+            raise ValueError("依赖计划批准的目录已经变化，请重新生成计划")
+        if plan["source_directories"] != self._source_directories(plan["snapshot_root"]):
+            raise RuntimeError("依赖计划输入快照目录发生变化")
+
     def revalidate(self, instance, plan_id):
         plan = self.store.read(self._reference(instance, "environment-plans", plan_id))
         if not plan or plan.get("plan_id") != plan_id or plan.get("instance_id") != instance["instance_id"]:
@@ -316,10 +395,7 @@ class EnvironmentManager:
             raise PermissionError("依赖计划的 pip 缓存不属于当前实例")
         for operation in plan["commands"]:
             self._pip_writable_paths(instance, operation["command"])
-        if plan["file_versions"] != file_manifest(instance["code_root"]):
-            raise ValueError("依赖计划批准的文件版本已经变化，请重新生成计划")
-        if plan["file_versions"] != file_manifest(plan["snapshot_root"]):
-            raise RuntimeError("依赖计划输入快照发生变化")
+        self._validate_plan_inputs(instance, plan)
         for name, version in plan.get("approval_file_versions", {}).items():
             if hashlib.sha256(self.store.path(name).read_bytes()).hexdigest() != version:
                 raise RuntimeError("依赖计划正式解析材料发生变化")
@@ -416,6 +492,7 @@ class EnvironmentManager:
             if not parsed["passed"]:
                 raise ValueError("依赖声明无法解析：" + json.dumps(parsed["errors"][:3], ensure_ascii=False)[:1000])
             plan["requirements_file_versions"] = parsed["file_versions"]
+            await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
             # 只为正式依赖声明中的本机 HTTP 来源启用 pip 的标准缓存适配器。
             plan["cache_trusted_hosts"] = self._loopback_cache_hosts(parsed)
             plan["commands"][1]["command"].extend(value for host in plan["cache_trusted_hosts"] for value in ("--trusted-host", host))
@@ -424,6 +501,7 @@ class EnvironmentManager:
             plan["preserved_packages"] = preserved
             plan["commands"][1]["command"].extend(preserved)
             await self._resolve_plan(instance, plan, directory, mappings)
+            await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
             plan["status"] = "planned"
             return plan
         except (Exception, asyncio.CancelledError) as error:
@@ -466,13 +544,13 @@ class EnvironmentManager:
             environment["pip_report_ref"] = report_path.relative_to(self.store.root).as_posix()
             environment["pip_report"] = json.loads(report_path.read_text(encoding="utf-8"))
             # 检查当前源码，保证安装期间发生的文件变化不能成为可用环境。
-            if plan["file_versions"] != await asyncio.to_thread(file_manifest, instance["code_root"]):
-                raise RuntimeError("安装期间实例文件发生变化，请重新生成依赖计划")
+            await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
             check = await self.inspect(instance, environment=environment, request=plan["request"])
             environment["postcheck"] = check
             if not check["passed"]:
                 raise RuntimeError("候选环境依赖或模块检查失败，保留当前环境；evidence_ref=" + check["evidence_ref"])
             self._verify_resolution(plan, environment["pip_report"], check["packages"])
+            await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
             environment.update(status="ready", packages=check["packages"], completed_at=utc_now(), summary="依赖安装与环境检查通过", warnings=[], preparation_scope={"model_data_status": "not_verified"})
             environment["dependency_fingerprint"] = self._dependency_fingerprint({**instance, "environment": environment})
             environment["candidate"] = False
@@ -654,6 +732,8 @@ class EnvironmentManager:
             package_log.write_text(json.dumps(checked["packages"], ensure_ascii=False), encoding="utf-8")
             observed = checked["packages"]
             if checked["passed"]:
+                if plan:
+                    await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
                 existing["postcheck"] = checked
                 self._describe(instance, existing)
                 self._save(instance, existing, invalidate=False)
@@ -668,6 +748,8 @@ class EnvironmentManager:
             existing["observed_packages"] = observed
             self._save(instance, existing)
             self.events.emit("environment.changed", {"environment_id": existing["environment_id"], "reason": "已安装依赖发生变化，按照当前声明创建新环境代次"}, instance_id=instance["instance_id"])
+        if install:
+            plan = await self._preflight_prepare(instance, plan)
         environment_id = plan["candidate_environment_id"] if plan else self.store.allocate_id("environment")
         relative = f"environments/{environment_id}"
         environment_root = self.settings.state_root / relative
@@ -729,8 +811,8 @@ class EnvironmentManager:
             else:
                 environment["status"] = "created"
             environment["completed_at"] = utc_now()
-            if plan and plan["file_versions"] != await asyncio.to_thread(file_manifest, root):
-                raise RuntimeError("准备环境期间实例文件发生变化，请重新生成计划")
+            if plan:
+                await asyncio.to_thread(self._validate_plan_inputs, instance, plan)
             if environment.get("dependency_spec"):
                 environment["dependency_spec"]["file_versions"] = environment["postcheck"]["file_versions"]
                 environment["dependency_fingerprint"] = self._dependency_fingerprint({**instance, "environment": environment})

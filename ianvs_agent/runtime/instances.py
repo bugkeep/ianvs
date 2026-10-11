@@ -175,6 +175,8 @@ class InstanceManager:
             instance.update(source_manifest=manifest, current_manifest=manifest, task_spec=configuration_evidence(code_root, benchmark_path), status="created")
             if instance["task_spec"]["status"] != "complete":
                 instance["status"] = "configuration_invalid"
+            from .original_goal import OriginalGoalStore
+            OriginalGoalStore(self.settings, self.store).capture(instance)
             self.store.write(f"{relative}/instance.json", instance)
         except Exception as error:
             instance.update(status="creation_failed", creation_error=str(error), creation_error_type=type(error).__name__)

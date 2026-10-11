@@ -9,7 +9,7 @@ def tool_evidence_references(data, instance_id):
         return set()
     references = {data[field] for field in ("path", "source", "reference", "full_output_ref") if isinstance(data.get(field), str)}
     prefix = f"instances/{instance_id}/"
-    for record in (data, data.get("postcheck"), data.get("current_check")):
+    for record in (data, data.get("postcheck"), data.get("current_check"), data.get("original_goal")):
         reference = record.get("evidence_ref") if isinstance(record, dict) else None
         if isinstance(reference, str) and reference.startswith(prefix):
             references.add(reference)

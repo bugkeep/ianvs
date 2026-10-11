@@ -10,9 +10,9 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-import yaml
-
 from .instances import configuration_evidence, file_manifest, utc_now, validate_identity
+from .goal_checks import compare_goal, original_metrics
+from .original_goal import OriginalGoalStore
 from .packages import package_identity
 from .processes import recorded_command
 
@@ -29,7 +29,7 @@ class Verifier:
         saved = self.store.read(f"instances/{instance_id}/instance.json")
         if saved is None or saved.get("instance_id") != instance_id:
             raise ValueError("验证实例没有对应的正式记录")
-        fields = ("code_root", "source_manifest", "task_spec", "environment")
+        fields = ("code_root", "source_manifest", "task_spec", "environment", "original_goal_ref", "goal_id", "goal_digest")
         if any(instance.get(field) != saved.get(field) for field in fields):
             raise ValueError("验证实例与正式源码、原始任务或环境记录不一致")
 
@@ -61,73 +61,7 @@ class Verifier:
         except (ValueError, SyntaxError, TypeError):
             return False
 
-    def _original_metrics(self, instance):
-        specification = instance.get("task_spec", {})
-        if specification.get("status") in {"pending", "incomplete"} or not specification.get("testenv_text"):
-            return []
-        testenv = self._mapping(self._document(specification["testenv_text"]).get("testenv"))
-        metrics = testenv.get("metrics")
-        return metrics if isinstance(metrics, list) and all(isinstance(item, dict) and isinstance(item.get("name"), str) for item in metrics) else []
-
-    @staticmethod
-    def _reference(root, value):
-        return (Path(root) / value).resolve() if isinstance(value, str) and value else None
-
-    @staticmethod
-    def _mapping(value):
-        return value if isinstance(value, dict) else {}
-
-    def _document(self, text):
-        try:
-            return self._mapping(yaml.safe_load(text or "{}"))
-        except yaml.YAMLError:
-            return {}
-
-    def _frozen_reference(self, instance, value, known_files):
-        root = Path(instance["code_root"]).resolve()
-        path = self._reference(root, value)
-        return path is not None and path.is_relative_to(root) and path.relative_to(root).as_posix() in known_files
-
-    def _goal_bindings(self, instance, run, acceptance, evidence, original_metrics):
-        root = instance["code_root"]
-        known_files = set(instance["source_manifest"]) | set(run.get("source_manifest") or {}) | set(acceptance.get("file_identities", {}))
-        current_testenv = self._mapping(self._mapping(evidence.get("testenv")).get("testenv"))
-        observed_metrics = current_testenv.get("metrics", [])
-        metric_bindings = isinstance(observed_metrics, list)
-        if metric_bindings:
-            for expected in original_metrics:
-                matching = [item for item in observed_metrics if isinstance(item, dict) and item.get("name") == expected["name"]]
-                if len(matching) != 1 or self._reference(root, matching[0].get("url")) != self._reference(root, expected.get("url")):
-                    metric_bindings = False
-        specification = instance.get("task_spec", {})
-        original_benchmark = self._document(specification.get("benchmark_text"))
-        original_job = self._mapping(original_benchmark.get("benchmarkingjob"))
-        current_job = self._mapping(self._mapping(evidence.get("benchmark")).get("benchmarkingjob"))
-        expected_object = self._mapping(original_job.get("test_object"))
-        current_object = self._mapping(current_job.get("test_object"))
-        algorithm_bindings = expected_object.get("type") == current_object.get("type")
-        observed_algorithms = current_object.get("algorithms", [])
-        expected_algorithms = expected_object.get("algorithms", [])
-        algorithm_bindings = algorithm_bindings and isinstance(expected_algorithms, list) and isinstance(observed_algorithms, list)
-        if algorithm_bindings:
-            for expected in expected_algorithms:
-                if not isinstance(expected, dict) or not isinstance(expected.get("name"), str):
-                    algorithm_bindings = False
-                    continue
-                matching = [item for item in observed_algorithms if isinstance(item, dict) and item.get("name") == expected["name"]]
-                if len(matching) != 1 or self._frozen_reference(instance, expected.get("url"), known_files) and self._reference(root, matching[0].get("url")) != self._reference(root, expected.get("url")):
-                    algorithm_bindings = False
-        original_testenv = self._mapping(self._document(specification.get("testenv_text")).get("testenv"))
-        expected_dataset = self._mapping(original_testenv.get("dataset"))
-        current_dataset = current_testenv.get("dataset", {})
-        dataset_bindings = isinstance(current_dataset, dict)
-        if dataset_bindings:
-            for name, value in expected_dataset.items():
-                if self._frozen_reference(instance, value, known_files) and self._reference(root, current_dataset.get(name)) != self._reference(root, value):
-                    dataset_bindings = False
-        return metric_bindings, algorithm_bindings, dataset_bindings
-
-    async def verify(self, instance, run, acceptance=None):
+    async def verify(self, instance, run, acceptance=None, original_goal=None):
         self._check_instance(instance)
         instance_id = instance["instance_id"]
         run_id = validate_identity(run["run_id"], "运行")
@@ -152,11 +86,18 @@ class Verifier:
         execution_completed = run["status"] == "completed" and run["exit_code"] == 0 and not run["timed_out"] and not run["interrupted"]
         if not execution_completed:
             reasons.append("本轮没有正常完成执行")
-        original_metrics = self._original_metrics(instance)
-        goal_available = bool(original_metrics) or bool(acceptance.get("required_metrics"))
+        goal = await asyncio.to_thread(OriginalGoalStore(self.settings, self.store).load, instance) if instance.get("original_goal_ref") else {}
+        metrics_spec = original_metrics(goal)
+        goal_available = goal.get("status") == "complete" and bool(metrics_spec)
+        goal_identity = bool(goal) and all(run.get(key) == instance.get(key) and run.get(key) is not None for key in ("original_goal_ref", "goal_id", "goal_digest"))
+        if original_goal is not None:
+            goal_identity = goal_identity and original_goal.get("evidence_ref") == run.get("original_goal_ref") and all(original_goal.get(key) == run.get(key) for key in ("goal_id", "goal_digest"))
+        checks.append({"name": "任务与本轮 Run 使用相同原目标版本", "status": "PASS" if goal_identity else "FAIL", "evidence_ref": instance.get("original_goal_ref")})
+        if not goal_identity:
+            reasons.append("本轮 Run 缺少当前原目标版本，或与任务绑定不一致；需要在正式目标下重新运行")
         if not goal_available:
-            reasons.append("冻结的原始验收目标缺失，需要明确原始指标与正确性要求")
-        required_metrics = list(dict.fromkeys([item["name"] for item in original_metrics] + acceptance.get("required_metrics", [])))
+            reasons.append("原目标来源缺失或结构尚未支持，需要核查正式来源记录中的未确认项目")
+        required_metrics = list(dict.fromkeys([item["name"] for item in metrics_spec] + acceptance.get("required_metrics", [])))
         testcases = {item["testcase_id"] for item in run["testcases"]}
         metrics = run["metrics"]
         completed = {event["payload"]["testcase_id"] for event in run["events"] if event["event_type"] == "testcase.completed"}
@@ -214,20 +155,11 @@ class Verifier:
         checks.append({"name": "运行后源码与数据保持一致", "status": "PASS" if unchanged else "FAIL"})
         if not unchanged:
             reasons.append("运行后文件已经变化，当前结果需要重新验证")
-        metric_identity = True
-        for item in original_metrics:
-            if item.get("url"):
-                relative = str(item["url"]).removeprefix("./")
-                if current.get(relative) != instance["source_manifest"].get(relative):
-                    metric_identity = False
-        checks.append({"name": "原始评测指标实现保持一致", "status": "PASS" if metric_identity else "FAIL"})
-        if not metric_identity:
-            reasons.append("评测指标实现与原始任务不一致")
         evidence = await asyncio.to_thread(configuration_evidence, instance["code_root"], instance["benchmark_path"])
-        metric_bindings, algorithm_bindings, dataset_bindings = self._goal_bindings(instance, run, acceptance, evidence, original_metrics)
-        for name, matches in (("原始指标名称与实现来源保持一致", metric_bindings), ("原始算法目标与配置来源保持一致", algorithm_bindings), ("冻结的原始数据来源保持一致", dataset_bindings)):
-            checks.append({"name": name, "status": "PASS" if matches else "FAIL"})
-            if not matches:
+        bindings = await asyncio.to_thread(compare_goal, instance, goal, evidence, current)
+        for name, matches in bindings.items():
+            checks.append({"name": name, "status": "SKIP" if not goal_available else "PASS" if matches else "FAIL"})
+            if goal_available and not matches:
                 reasons.append(name.replace("保持一致", "被替换"))
         protected = ["core/common/events.py", "core/testcasecontroller/testcase/testcase.py", "core/storymanager/rank/rank.py"]
         audit_identity = all(instance["source_manifest"].get(path) is not None and current.get(path) == instance["source_manifest"][path] for path in protected)
@@ -235,7 +167,7 @@ class Verifier:
         if not audit_identity:
             reasons.append("审计或评分生成代码与冻结身份不一致")
         checks.append({"name": "原始验收目标存在", "status": "PASS" if goal_available else "SKIP"})
-        checks_passed = static["passed"] and unchanged and metric_identity and metric_bindings and algorithm_bindings and dataset_bindings and environment_ready and environment_unchanged and audit_identity and goal_available and benchmark_matches and not unsupported
+        checks_passed = static["passed"] and unchanged and all(bindings.values()) and environment_ready and environment_unchanged and audit_identity and goal_available and goal_identity and benchmark_matches and not unsupported
         for name in acceptance.get("required_checks", []):
             matching = [check for check in checks if check["name"] == name]
             if not matching or not all(check["status"] == "PASS" for check in matching):
@@ -268,6 +200,9 @@ class Verifier:
         if not current_run:
             reasons.append("该验证属于历史 Run，最新 Run 仍需独立验证")
         result = {"run_id": run["run_id"], "instance_id": instance["instance_id"], "passed": passed, "execution_completed": execution_completed, "results_complete": results_complete, "checks_passed": checks_passed, "goal_achieved": goal_achieved, "repair_completed": passed and bool(acceptance.get("repair_task_id")) and repair_run_fresh and current_run, "checks": checks, "reasons": reasons, "unsupported_acceptance_fields": unsupported, "evidence_type": "real_ianvs_run", "verified_at": utc_now(), "static_report_ref": static["report_ref"], "acceptance": acceptance, "stale": not current_run}
+        result.update(original_goal_ref=instance.get("original_goal_ref"), goal_id=instance.get("goal_id"), goal_digest=instance.get("goal_digest"), goal_source_status=goal.get("status", "source_missing"), unresolved_goal_sources=goal.get("unresolved", []), goal_check_limitations=goal.get("limitations", []))
+        if original_goal is not None:
+            result["task_original_goal"] = original_goal
         relative = f"instances/{instance['instance_id']}/runs/{run['run_id']}/verification.json"
         self.store.write(relative, result)
         if current_run:

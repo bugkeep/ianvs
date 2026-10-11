@@ -12,6 +12,7 @@ from pathlib import Path
 
 import psutil
 from .instances import configuration_evidence, file_manifest, utc_now, validate_identity
+from .original_goal import OriginalGoalStore
 from .processes import _terminate_owned, runtime_environment, spawn, terminate_process
 from .credentials import SecretRedactor, credential_status, resolve_credentials
 
@@ -82,7 +83,7 @@ class Runner:
                 self._invalidate_verification(instance, run["run_id"], "needs_verification")
         return list(self._orphaned)
 
-    async def run(self, instance, overrides=None):
+    async def run(self, instance, overrides=None, *, original_goal=None):
         if self._current is None and self._orphaned:
             self.recover()
         if self._current is not None or self._orphaned:
@@ -112,6 +113,15 @@ class Runner:
         event_pipe_path = None
         temporary = run_root / "temporary"
         try:
+            goals = OriginalGoalStore(self.settings, self.store)
+            if original_goal is None:
+                await asyncio.to_thread(goals.resolve, instance)
+            else:
+                await asyncio.to_thread(goals.load, instance)
+                if original_goal.get("evidence_ref") != instance.get("original_goal_ref") or any(original_goal.get(key) != instance.get(key) for key in ("goal_id", "goal_digest")):
+                    raise ValueError("任务绑定的原目标版本与实例正式记录不一致")
+            run.update({key: instance[key] for key in ("original_goal_ref", "goal_id", "goal_digest")})
+            self._save(run)
             if environment.get("status") not in {"ready", "modified"} or not python or not Path(python).is_file():
                 raise RuntimeError("实例环境尚未准备完成")
             run["credential_status"] = credential_status(self.settings, instance)

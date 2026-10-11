@@ -22,6 +22,8 @@ from charset_normalizer.utils import identify_sig_or_bom
 from ianvs_agent.runtime.instances import configuration_evidence
 from ianvs_agent.runtime.environment import environment_summary
 from ianvs_agent.runtime.credentials import credential_status
+from ianvs_agent.runtime.goal_checks import goal_summary
+from ianvs_agent.runtime.original_goal import OriginalGoalStore
 from ianvs_agent.runtime.processes import sandboxed_command
 from .operations import register_operations
 
@@ -203,6 +205,10 @@ class CodeTools:
         relative = str(target.relative_to(self.harness.store.root)).replace("\\", "/")
         base = f"instances/{self.instance['instance_id']}/"
         permitted = (base + "runs/", self.harness.session_relative_path + "/tool-output/")
+        original_goal = False
+        if target.parent == self.harness.store.path(base + "original-goals"):
+            OriginalGoalStore(self.harness.settings, self.harness.store).load(self.instance, relative)
+            original_goal = True
         environment_log = False
         if relative.startswith("environments/") and len(Path(relative).parts) >= 3:
             environment_id = Path(relative).parts[1]
@@ -222,8 +228,8 @@ class CodeTools:
                 if record.get(name):
                     references.add(self.harness.store.read(record[name], {}).get("log_ref"))
             operation_evidence = record.get("instance_id") == self.instance["instance_id"] and (relative in references or str(target) in references)
-        if not relative.startswith(permitted) and not environment_log and not operation_evidence and not self._registered_validation_report(relative):
-            raise PermissionError("只能读取当前实例已登记的运行、工具、验证报告或环境日志证据")
+        if not relative.startswith(permitted) and not original_goal and not environment_log and not operation_evidence and not self._registered_validation_report(relative):
+            raise PermissionError("只能读取当前实例已登记的原目标、运行、工具、验证报告或环境日志证据")
         if not target.is_file():
             raise PermissionError("证据引用必须指向已经保存的普通文件")
         if start_line < 1 or end_line < start_line or end_line - start_line > 2000:
@@ -237,6 +243,8 @@ class CodeTools:
         self.harness.store.write(reference, instance)
         fields = ("instance_id", "name", "status", "benchmark_path", "code_root", "readme_path", "last_run_id", "needs_verification", "environment_changed", "source_updates_checked_at")
         summary = {key: instance[key] for key in fields if key in instance}
+        goal_reference = instance.get("original_goal_ref")
+        summary["original_goal"] = goal_summary(self.harness.store.read(goal_reference) if goal_reference else None)
         environment = instance.get("environment") or {}
         summary["environment"] = environment_summary(environment)
         summary["runtime_credentials"] = credential_status(self.harness.settings, instance)
@@ -298,10 +306,15 @@ class CodeTools:
             relative = target.relative_to(self.code_root).as_posix()
             if relative.startswith(("core/", "ianvs_agent/", ".github/workflows/validator/")):
                 raise PermissionError("当前工具无权修改运行控制、事件、评分或验证程序")
-            frozen = self.instance.get("task_spec", {}).get("testenv_text")
-            metrics = yaml.safe_load(frozen).get("testenv", {}).get("metrics", []) if frozen else []
-            if any(str(metric.get("url", "")).removeprefix("./") == relative for metric in metrics):
-                raise PermissionError("当前工具无权修改原始评测指标实现")
+            if self.instance.get("original_goal_ref"):
+                goal = OriginalGoalStore(self.harness.settings, self.harness.store).load(self.instance)
+                if any(item["path"] == relative for item in goal.get("metric_sources", [])):
+                    raise PermissionError("当前工具无权修改原始评测指标实现")
+            else:
+                frozen = self.instance.get("task_spec", {}).get("testenv_text")
+                metrics = yaml.safe_load(frozen).get("testenv", {}).get("metrics", []) if frozen else []
+                if isinstance(metrics, list) and any(isinstance(metric, dict) and str(metric.get("url", "")).removeprefix("./") == relative for metric in metrics):
+                    raise PermissionError("当前工具无权修改原始评测指标实现")
             version = hashlib.sha256(target.read_bytes()).hexdigest() if target.exists() else "absent"
             if expected_versions.get(relative) != version:
                 raise PermissionError(f"{relative} 的修改依据缺失或文件已变化，请重新读取和审批")
@@ -428,7 +441,7 @@ def register_tools(harness, registry):
     integer = {"type": "integer"}
     registry.register("read_file", "读取当前实例源码和配置，支持 UTF-8 及带 BOM 的 UTF-16/UTF-32，正式记录行号、内容与版本供补丁审批使用；不存在的路径返回 exists=false、file_version=absent，作为新文件的创建依据", {"path": string, "start_line": integer, "end_line": integer}, ["path"], code.read_file)
     registry.register("search_text", "按 Python 正则逐行搜索当前实例文本；paths 默认为 examples、core，可指定源码相对路径。返回文件路径、行号、分页位置、搜索范围和跳过原因；支持 UTF-8 及带 BOM 的 UTF-16/UTF-32，不跟随符号链接；limit 1..1000，默认 50", {"pattern": string, "paths": {"type": "array", "items": string, "minItems": 1}, "limit": {"type": "integer", "minimum": 1, "maximum": SEARCH_MAX_LIMIT, "default": 50}, "cursor": {"type": "integer", "minimum": 0, "default": 0}}, ["pattern"], code.search_text)
-    registry.register("read_evidence", "读取当前实例已登记的 Run、工具全文、独立验证报告或当前环境日志证据；使用工具返回的 reference/report_ref/static_report_ref", {"reference": string, "start_line": integer, "end_line": integer}, ["reference"], code.read_evidence)
+    registry.register("read_evidence", "读取当前实例已登记的原目标来源、Run、工具全文、独立验证报告或当前环境日志证据；使用工具返回的 evidence_ref/reference/report_ref/static_report_ref", {"reference": string, "start_line": integer, "end_line": integer}, ["reference"], code.read_evidence)
     registry.register("apply_patch", "只提交完整 unified diff，程序自动绑定本任务 read_file 正式读取的版本并审批，执行前检查当前文件；未读取或文件变化时拒绝，创建新文件须先 read_file 确认不存在。使用 --- a/path、+++ b/path 和准确的 @@ 行范围，保留原文上下文并以换行结束", {"patch": string}, ["patch"], code.apply_patch, modifies=True, approval_context=code.patch_approval)
     registry.register("bash", "在实例源码目录运行只读调查命令，支持 pwd、ls、stat；文本搜索使用 search_text", {"command": string, "timeout": {"type": "number"}}, ["command"], code.bash)
 
@@ -468,7 +481,7 @@ def register_tools(harness, registry):
         if not identity:
             raise ValueError("本任务尚无运行记录")
         run = harness.runner.get_run(code.instance["instance_id"], identity)
-        result = await harness.verifier.verify(code.instance, run, harness.task.get("acceptance"))
+        result = await harness.verifier.verify(code.instance, run, harness.task.get("acceptance"), harness.task.get("original_goal"))
         harness.current_instance = harness.instances.get(code.instance["instance_id"])
         harness.state["verification"] = harness.current_instance.get("verification") or {"passed": False, "status": "needs_verification"}
         await harness._save_session_async()

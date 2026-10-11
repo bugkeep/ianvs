@@ -52,24 +52,24 @@ class EnvironmentPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("environment.step_completed", kinds)
         self.assertIn("environment.completed", kinds)
 
-    async def test_local_pip_failure_retains_step_log_and_summary(self):
-        # 源码副本缺少核心 requirements，实际 pip 在解析本地文件时结束。
-        with self.assertRaises(RuntimeError):
+    async def test_missing_local_dependency_retains_preflight_evidence_without_venv(self):
+        with self.assertRaisesRegex(ValueError, "requirements.txt"):
             await self.manager.prepare(self.instance)
-        saved = self.store.read(f"instances/{self.instance['instance_id']}/instance.json")["environment"]
-        self.assertEqual(saved["status"], "failed")
-        self.assertEqual(saved["steps"][0]["status"], "completed")
-        failed = saved["failed_step"]
-        self.assertEqual(failed["name"], "core_install")
-        self.assertEqual(failed["status"], "failed")
-        log = Path(failed["log_ref"]).read_text(encoding="utf-8", errors="replace")
-        self.assertTrue(log)
-        self.assertIn(failed["error_tail"], log)
-        self.assertLessEqual(len(failed["error_tail"]), 1000)
-        self.assertIn("环境准备失败", saved["summary"])
-        failures = [event for event in self.store.read_events("events.jsonl") if event["event_type"] == "environment.step_failed"]
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]["payload"]["error_tail"], failed["error_tail"])
+        saved = self.store.read(f"instances/{self.instance['instance_id']}/instance.json")
+        self.assertIsNone(saved.get("environment"))
+        plan = self.store.read(saved["environment_operation_ref"])
+        self.assertEqual(plan["status"], "invalid")
+        self.assertFalse(plan["dependencies"]["passed"])
+        self.assertTrue(any("requirements.txt" in item["error"] for item in plan["dependencies"]["errors"]))
+        self.assertFalse(Path(plan["venv_root"]).exists())
+        operation = self.store.read(plan["parse_operation_ref"])
+        self.assertEqual(operation["status"], "completed")
+        self.assertFalse(operation["isolation"]["network"])
+        self.assertTrue(Path(operation["log_ref"]).is_file())
+        self.assertEqual(self.store.read(plan["parse_result_ref"]), plan["dependencies"])
+        kinds = [event["event_type"] for event in self.store.read_events("events.jsonl")]
+        self.assertNotIn("environment.started", kinds)
+        self.assertNotIn("environment.step_started", kinds)
 
     async def test_completed_local_pip_command_has_persistent_trace(self):
         environment = await self.manager.prepare(self.instance, install=False)
