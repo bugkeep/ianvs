@@ -61,7 +61,7 @@ class CachedRunner:
 
 
 class RemoteHarness:
-    ACTIONS = {"create_instance", "restore_instance", "prepare_instance", "run_current", "send_message", "resume_current", "execute_tool", "switch_model", "compact"}
+    ACTIONS = {"create_instance", "restore_instance", "delete_instance", "prepare_instance", "run_current", "send_message", "resume_current", "execute_tool", "switch_model", "compact"}
 
     def __init__(self, settings, command, backend_label="WSL"):
         if not isinstance(command, list) or not command or not all(isinstance(item, str) for item in command):
@@ -171,7 +171,7 @@ class RemoteHarness:
             self.process.stdin.close()
 
     def _update_settings(self, public):
-        synchronized = {"selected_profile", "context_threshold", "context_input_budget", "keep_recent_turns", "max_model_calls", "max_tool_calls", "max_input_tokens", "max_output_tokens", "max_task_seconds", "max_repair_attempts", "tool_output_chars", "run_timeout_seconds", "approval_policy", "dependency_mode"}
+        synchronized = {"selected_profile", "context_threshold", "context_input_budget", "keep_recent_turns", "max_model_calls", "max_tool_calls", "max_input_tokens", "max_output_tokens", "max_task_seconds", "max_repair_attempts", "tool_output_chars", "run_timeout_seconds", "pip_timeout_seconds", "pip_retries", "approval_policy", "dependency_mode"}
         for name, value in public.items():
             if name == "profiles":
                 self.settings.profiles = {key: ModelProfile(**profile) for key, profile in value.items()}
@@ -332,6 +332,9 @@ class RemoteHarness:
 
     async def restore_instance(self, instance_id):
         return await self._rpc("restore_instance", {"instance_id": instance_id})
+
+    async def delete_instance(self, instance_id):
+        return await self._rpc("delete_instance", {"instance_id": instance_id})
 
     async def prepare_instance(self):
         return await self._rpc("prepare_instance", {})

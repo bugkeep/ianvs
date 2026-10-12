@@ -38,6 +38,7 @@ class AgentHarness:
         self.events = EventBus(self.store)
         self.catalog = ExampleCatalog(settings.project_root)
         self.instances = InstanceManager(settings, self.store, self.events)
+        self.deletion_recovery = self.instances.recover_pending_deletions()
         self.original_goals = OriginalGoalStore(settings, self.store)
         self.environment = EnvironmentManager(settings, self.store, self.events)
         self.runner = Runner(settings, self.store, self.events)
@@ -52,6 +53,7 @@ class AgentHarness:
         self.context = None
         self.busy = False
         self._active_task = None
+        self._deleting_instance_id = None
         self._cancel_requested = False
         self._compact_requested = False
         self._execution_started = None
@@ -159,6 +161,49 @@ class AgentHarness:
 
     async def restore_instance(self, instance_id):
         return await self._action(self._restore(instance_id))
+
+    async def delete_instance(self, instance_id):
+        if self.busy or self._active_task or self.tools.pending:
+            raise RuntimeError("当前任务正在执行，请先取消任务后再删除实例")
+        if instance_id in self.environment._preparing:
+            raise RuntimeError("实例环境正在准备，请先取消任务后再删除实例")
+        commands = getattr(self, "environment_commands", None)
+        if commands is not None and instance_id in commands.active:
+            raise RuntimeError("实例仍有活动环境命令，请先取消任务后再删除实例")
+        self.busy = True
+        self._active_task = asyncio.current_task()
+        try:
+            async with self._session_save_guard:
+                await self._run_sync(self.instances.preview_deletion, instance_id)
+                self._deleting_instance_id = instance_id
+                if self.current_instance and self.current_instance["instance_id"] == instance_id:
+                    if self.provider:
+                        self._providers.append(self.provider)
+                    self.current_instance = self.session = self.session_relative_path = None
+                    self.task, self.state, self._messages = {}, {}, []
+                    self.usage = self.context = self.provider = None
+                    self._compact_requested = self._cancel_requested = False
+                    self.events.bind(instance_id=None, session_id=None, task_id=None, environment_id=None, run_id=None)
+                if self.environment._last_instance and self.environment._last_instance["instance_id"] == instance_id:
+                    self.environment._last_instance = None
+                # 永久清理开始后等待所属目录处理结束，取消不会留下后台删除线程。
+                pending = asyncio.create_task(asyncio.to_thread(self.instances.delete, instance_id))
+                while True:
+                    try:
+                        result = await asyncio.shield(pending)
+                        break
+                    except asyncio.CancelledError:
+                        if pending.cancelled():
+                            raise
+                self.events.emit("instance.deleted", result, instance_id=instance_id, session_id=None, task_id=None, environment_id=None, run_id=None)
+                return result
+        except Exception as error:
+            self.events.emit("instance.deletion_failed", {"instance_id": instance_id, "message": str(error)}, instance_id=instance_id, session_id=None, task_id=None, environment_id=None, run_id=None)
+            raise
+        finally:
+            self.busy = False
+            self._active_task = None
+            self._deleting_instance_id = None
 
     async def _restore(self, instance_id):
         await asyncio.to_thread(self._select_instance, instance_id)
@@ -725,6 +770,8 @@ class AgentHarness:
         await self._finish("failed", self.state["error"])
 
     async def cancel(self):
+        if self._deleting_instance_id is not None:
+            return {"status": "deleting", "instance_id": self._deleting_instance_id}
         self._cancel_requested = True
         self.tools.cancel_approvals()
         commands = getattr(self, "environment_commands", None)
@@ -760,6 +807,8 @@ class AgentHarness:
         if not self.session_relative_path:
             return
         async with self._session_save_guard:
+            if not self.session_relative_path:
+                return
             await self._run_sync(self._persist_session, self.session_relative_path, self._session_snapshot())
 
     @staticmethod

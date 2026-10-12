@@ -83,6 +83,39 @@ class ExitScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class DeleteInstanceScreen(ModalScreen[bool]):
+    BINDINGS = [("escape", "cancel_delete", "取消删除")]
+
+    def __init__(self, instance):
+        super().__init__()
+        self.instance_id = instance["instance_id"]
+        self.instance_name = instance.get("name") or self.instance_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="delete-instance-dialog"):
+            yield Static("永久删除实例", classes="dialog-title")
+            yield Static(Text(f"示例：{self.instance_name}\n实例编号：{self.instance_id}"), id="delete-instance-identity")
+            yield Static("将永久删除此实例的源码副本、独立 Python 环境、缓存、对话、补丁和运行记录，删除后无法恢复。", id="delete-instance-description")
+            yield Static("原始项目、外部模型与数据、其他实例将保留。", classes="muted")
+            with Horizontal(classes="dialog-actions"):
+                yield Button("取消", id="cancel-delete-instance", variant="primary")
+                yield Button("永久删除", id="confirm-delete-instance", variant="error")
+
+    def on_mount(self):
+        self.query_one("#cancel-delete-instance", Button).focus()
+
+    @on(Button.Pressed, "#cancel-delete-instance")
+    def cancel_delete_button(self):
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#confirm-delete-instance")
+    def confirm_delete_button(self):
+        self.dismiss(True)
+
+    def action_cancel_delete(self):
+        self.dismiss(False)
+
+
 class ToolDetailsScreen(ModalScreen[None]):
     BINDINGS = [("escape", "close_details", "关闭详情")]
 

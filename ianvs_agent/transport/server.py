@@ -54,6 +54,7 @@ class BackendService:
         self.methods = {
             "create_instance": ({"benchmark_path"}, self.harness.create_instance),
             "restore_instance": ({"instance_id"}, self.harness.restore_instance),
+            "delete_instance": ({"instance_id"}, self.delete_instance),
             "prepare_instance": (set(), self.harness.prepare_instance),
             "run_current": (set(), self.harness.run_current),
             "send_message": ({"text"}, self.harness.send_message),
@@ -174,7 +175,7 @@ class BackendService:
             try:
                 kind = event["event_type"]
                 if kind not in {"llm.started", "llm.delta", "llm.progress", "llm.retry", "context.preparing", "run.output", "environment.command_progress"}:
-                    await self.publish_snapshot(history=kind in {"agent.message", "context.compacted", "agent.completed", "agent.failed", "agent.blocked", "agent.cancelled"}, diff=kind == "patch.applied", instances=kind in {"instance.created", "environment.prepared", "verification.completed"})
+                    await self.publish_snapshot(history=kind in {"agent.message", "context.compacted", "agent.completed", "agent.failed", "agent.blocked", "agent.cancelled"}, diff=kind == "patch.applied", instances=kind in {"instance.created", "instance.deleted", "instance.deletion_failed", "environment.prepared", "verification.completed"})
                 await self.send({"type": "event", "event": event})
             except Exception as error:
                 self.fatal_error = error
@@ -196,6 +197,10 @@ class BackendService:
             raise ValueError("工具请求名称、调用 ID 或参数无效")
         self.harness._ensure_task("执行用户指定工具：" + call["name"])
         return await self.harness._action(self.harness.tools.execute(copy.deepcopy(call)))
+
+    async def delete_instance(self, instance_id):
+        async with self.snapshot_lock:
+            return await self.harness.delete_instance(instance_id)
 
     async def refresh(self):
         return {"status": "refreshed"}

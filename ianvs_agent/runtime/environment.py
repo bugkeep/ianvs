@@ -477,7 +477,7 @@ class EnvironmentManager:
         plan["resolve_operation_ref"] = reference
         self.store.write(plan["evidence_ref"], plan)
         try:
-            await sandboxed_command(command, plan["code_root"], self.settings.python_executable, output / "output.log", timeout=plan["timeout"], writable_paths=[output, *self._pip_writable_paths(instance, command)], network=True, operation=operation, on_update=lambda _: self.store.write(reference, operation))
+            await sandboxed_command(command, plan["code_root"], self.settings.python_executable, output / "output.log", timeout=plan["timeout"], writable_paths=[output, *self._pip_writable_paths(instance, command)], network=True, operation=operation, on_update=lambda _: self.store.write(reference, operation), pip_timeout_seconds=self.settings.pip_timeout_seconds, pip_retries=self.settings.pip_retries)
         finally:
             operation["completed_at"] = utc_now()
             self.store.write(reference, operation)
@@ -770,7 +770,7 @@ class EnvironmentManager:
         identities = {"instance_id": instance["instance_id"], "environment_id": environment["environment_id"]}
         self.events.emit("environment.step_started", step, **identities)
         try:
-            await sandboxed_command(command, cwd, python, log_path, timeout=timeout, writable_paths=[*writable_paths, *self._pip_writable_paths(instance, command)], readonly_paths=readonly_paths, network=network, operation=step, on_update=lambda _: self._save(instance, environment))
+            await sandboxed_command(command, cwd, python, log_path, timeout=timeout, writable_paths=[*writable_paths, *self._pip_writable_paths(instance, command)], readonly_paths=readonly_paths, network=network, operation=step, on_update=lambda _: self._save(instance, environment), pip_timeout_seconds=self.settings.pip_timeout_seconds, pip_retries=self.settings.pip_retries)
         except (Exception, asyncio.CancelledError) as error:
             step.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", error=str(error) or "操作已取消", completed_at=utc_now())
             if Path(log_path).is_file():

@@ -116,7 +116,7 @@ class EnvironmentCommands:
                 raise
             if hashlib.sha256(json.dumps(copied, sort_keys=True).encode()).hexdigest() != plan["source_revision"]:
                 raise PermissionError("命令执行前的源码版本发生变化，需要重新审批")
-            await sandboxed_command(plan["command"], plan["cwd"], plan["python_executable"], folder / "output.log", timeout=timeout, readonly_paths=[root], writable_paths=[root / name for name in plan["writable_directories"]], network=network, operation=record, on_update=save)
+            await sandboxed_command(plan["command"], plan["cwd"], plan["python_executable"], folder / "output.log", timeout=timeout, readonly_paths=[root], writable_paths=[root / name for name in plan["writable_directories"]], network=network, operation=record, on_update=save, pip_timeout_seconds=self.settings.pip_timeout_seconds, pip_retries=self.settings.pip_retries)
         except (Exception, asyncio.CancelledError) as error:
             record.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", error=str(error) or type(error).__name__)
             raise

@@ -3,6 +3,7 @@
 
 import asyncio
 import inspect
+import math
 import os
 import signal
 import subprocess
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import psutil
 
-from .sandbox import sandbox_command
+from .sandbox import sandbox_command, sandbox_network
 
 
 def runtime_environment(python=None):
@@ -137,9 +138,13 @@ async def recorded_command(command, cwd, python, log_path, timeout=900, *, check
     return {"command": list(command), "exit_code": process.returncode, "log_ref": str(log_path)}
 
 
-async def sandboxed_command(command, cwd, python, log_path, timeout=900, *, writable_paths=(), readonly_paths=(), network=False, operation=None, on_update=None):
+async def sandboxed_command(command, cwd, python, log_path, timeout=900, *, writable_paths=(), readonly_paths=(), network=False, operation=None, on_update=None, pip_timeout_seconds=60, pip_retries=5):
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise ValueError("环境命令时限必须为正数")
+    if isinstance(pip_timeout_seconds, bool) or not isinstance(pip_timeout_seconds, (int, float)) or not math.isfinite(pip_timeout_seconds) or pip_timeout_seconds <= 0:
+        raise ValueError("pip 网络请求时限必须为有限正数")
+    if isinstance(pip_retries, bool) or not isinstance(pip_retries, int) or pip_retries < 0:
+        raise ValueError("pip 网络重试次数必须为非负整数")
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = log_path.parent / "temporary"
@@ -154,24 +159,27 @@ async def sandboxed_command(command, cwd, python, log_path, timeout=900, *, writ
                 await response
 
     await update()
-    try:
-        execution, isolation = await asyncio.to_thread(sandbox_command, list(command), cwd, python, temporary, writable_paths=writable_paths, readonly_paths=readonly_paths, readonly_mappings=result.get("readonly_mappings", ()), network=network)
-    except (Exception, asyncio.CancelledError) as error:
-        log_path.write_text(f"环境执行预检失败：{type(error).__name__}: {error}\n", encoding="utf-8")
-        result.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", error=str(error) or "预检已取消")
-        await update()
-        raise
-    result.update(isolation=isolation, phase="spawn")
-    environment = runtime_environment(python)
-    if result.get("operation_id"):
-        environment["IANVS_OPERATION_ID"] = result["operation_id"]
-    try:
-        process = await spawn(execution, cwd, environment, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    except (Exception, asyncio.CancelledError) as error:
-        log_path.write_text(f"环境进程启动失败：{type(error).__name__}: {error}\n", encoding="utf-8")
-        result.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", error=str(error) or "启动已取消")
-        await update()
-        raise
+    with sandbox_network(network) as (proxy_fd, proxy_names, redactor):
+        try:
+            execution, isolation = await asyncio.to_thread(sandbox_command, list(command), cwd, python, temporary, writable_paths=writable_paths, readonly_paths=readonly_paths, readonly_mappings=result.get("readonly_mappings", ()), network=network, proxy_fd=proxy_fd, proxy_names=proxy_names, pip_timeout_seconds=pip_timeout_seconds, pip_retries=pip_retries)
+        except (Exception, asyncio.CancelledError) as error:
+            safe_error = redactor.feed(str(error).encode("utf-8"), final=True).decode("utf-8", errors="replace")
+            log_path.write_text(f"环境执行预检失败：{type(error).__name__}: {safe_error}\n", encoding="utf-8")
+            result.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", error=safe_error or "预检已取消")
+            await update()
+            raise
+        result.update(isolation=isolation, phase="spawn")
+        environment = runtime_environment(python)
+        if result.get("operation_id"):
+            environment["IANVS_OPERATION_ID"] = result["operation_id"]
+        try:
+            process = await spawn(execution, cwd, environment, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, pass_fds=(proxy_fd,) if proxy_fd is not None else ())
+        except (Exception, asyncio.CancelledError) as error:
+            safe_error = redactor.feed(str(error).encode("utf-8"), final=True).decode("utf-8", errors="replace")
+            log_path.write_text(f"环境进程启动失败：{type(error).__name__}: {safe_error}\n", encoding="utf-8")
+            result.update(status="cancelled" if isinstance(error, asyncio.CancelledError) else "failed", error=safe_error or "启动已取消")
+            await update()
+            raise
     try:
         created = psutil.Process(process.pid).create_time()
     except psutil.NoSuchProcess:
@@ -181,8 +189,10 @@ async def sandboxed_command(command, cwd, python, log_path, timeout=900, *, writ
     async def stream():
         with log_path.open("wb") as output:
             while chunk := await process.stdout.read(8192):
-                output.write(chunk)
+                output.write(redactor.feed(chunk))
                 output.flush()
+            output.write(redactor.feed(b"", final=True))
+            output.flush()
 
     reader = asyncio.create_task(stream())
     try:

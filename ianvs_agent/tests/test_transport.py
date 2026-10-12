@@ -100,6 +100,45 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         patch = "".join(difflib.unified_diff(original.splitlines(keepends=True), updated.splitlines(keepends=True), fromfile="a/" + relative, tofile="b/" + relative))
         return self.call(identity, "apply_patch", {"patch": patch}), path, original, updated
 
+    async def test_instance_deletion_with_concurrent_snapshots_keeps_backend_usable(self):
+        first = await self.start_instance()
+        second = await self.remote.create_instance(self.benchmark)
+        second_record = self.state_root / "instances" / second["instance_id"] / "instance.json"
+        second_before = second_record.read_bytes()
+        await self.remote.restore_instance(first["instance_id"])
+        results = await asyncio.gather(self.remote.delete_instance(first["instance_id"]), *(self.remote.refresh() for _ in range(12)))
+        self.assertEqual(results[0]["status"], "deleted")
+        self.assertTrue(self.remote.connected)
+        self.assertIsNone(self.remote.current_instance)
+        self.assertIsNone(self.remote.session)
+        self.assertEqual(self.remote.history(), [])
+        self.assertEqual(self.remote.diff(), "")
+        self.assertEqual(self.remote.verification_report(), {})
+        self.assertEqual(self.remote.usage_summary()["model_calls"], 0)
+        self.assertFalse((self.state_root / "instances" / first["instance_id"]).exists())
+        self.assertEqual(second_record.read_bytes(), second_before)
+        self.assertEqual([item["instance_id"] for item in self.remote.instances.list_instances()], [second["instance_id"]])
+        deletion = await self.wait_event("instance.deleted")
+        self.assertIsNone(deletion["session_id"])
+        await self.remote.close()
+        self.assertFalse((self.state_root / "instances" / first["instance_id"]).exists())
+        await self.remote.start()
+        self.assertIsNone(self.remote.current_instance)
+        await self.remote.restore_instance(second["instance_id"])
+        self.assertEqual(self.remote.current_instance["instance_id"], second["instance_id"])
+        self.assertEqual(self.remote.usage_summary()["model_calls"], 0)
+
+    async def test_invalid_deletion_preserves_current_session_and_backend(self):
+        instance = await self.start_instance()
+        before = copy.deepcopy((self.remote.current_instance, self.remote.session, self.remote.task, self.remote.state, self.remote.history()))
+        with self.assertRaises(RemoteCallError):
+            await self.remote.delete_instance("../outside")
+        after = (self.remote.current_instance, self.remote.session, self.remote.task, self.remote.state, self.remote.history())
+        self.assertEqual(after, before)
+        self.assertTrue(self.remote.connected)
+        self.assertTrue((self.state_root / "instances" / instance["instance_id"] / "instance.json").is_file())
+        self.assertEqual((await self.remote.refresh())["status"], "refreshed")
+
     async def test_real_backend_browsing_instance_and_model_switch_use_no_llm(self):
         self.assertFalse(self.remote.connected)
         self.assertFalse(self.state_root.exists())

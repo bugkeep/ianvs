@@ -16,6 +16,9 @@ max_output_tokens: 100000
 max_task_seconds: 1800
 max_repair_attempts: 5
 run_timeout_seconds: 600
+# pip 单次网络请求时限；环境安装步骤另有总执行时限。
+pip_timeout_seconds: 60
+pip_retries: 5
 tool_output_chars: 16000
 # 值为后端环境变量名称，实例审批绑定后才传给 Example。
 runtime_credentials:

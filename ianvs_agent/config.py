@@ -1,6 +1,7 @@
 # Copyright 2026 The KubeEdge Authors.
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -46,6 +47,8 @@ class AgentSettings:
     max_repair_attempts: int = 5
     tool_output_chars: int = 16000
     run_timeout_seconds: float = 600
+    pip_timeout_seconds: float = 60
+    pip_retries: int = 5
     approval_policy: str = "manual"
     dependency_mode: str = "isolated"
     wsl_distribution: str = "Ubuntu-24.04"
@@ -85,6 +88,10 @@ def load_settings(project_root=None, config_path=None, *, load_credentials=True)
         raise ValueError("选中的模型配置不存在")
     if not 0 < settings.context_threshold < 1:
         raise ValueError("上下文压缩阈值必须在 0 和 1 之间")
+    if isinstance(settings.pip_timeout_seconds, bool) or not isinstance(settings.pip_timeout_seconds, (int, float)) or not math.isfinite(settings.pip_timeout_seconds) or settings.pip_timeout_seconds <= 0:
+        raise ValueError("pip 网络请求时限必须为有限正数")
+    if isinstance(settings.pip_retries, bool) or not isinstance(settings.pip_retries, int) or settings.pip_retries < 0:
+        raise ValueError("pip 网络重试次数必须为非负整数")
     if settings.context_input_budget is not None and (isinstance(settings.context_input_budget, bool) or not isinstance(settings.context_input_budget, int) or settings.context_input_budget <= 0):
         raise ValueError("单次上下文输入预算必须为空值或正整数")
     for profile in resolved.values():

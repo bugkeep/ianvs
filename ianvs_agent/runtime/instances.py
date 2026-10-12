@@ -198,6 +198,18 @@ class InstanceManager:
             raise ValueError("实例记录身份与请求不一致")
         return instance
 
+    def preview_deletion(self, instance_id):
+        from .instance_deletion import InstanceDeletionManager
+        return InstanceDeletionManager(self).preview(instance_id)
+
+    def delete(self, instance_id):
+        from .instance_deletion import InstanceDeletionManager
+        return InstanceDeletionManager(self).delete(instance_id)
+
+    def recover_pending_deletions(self):
+        from .instance_deletion import InstanceDeletionManager
+        return InstanceDeletionManager(self).recover()
+
     def check_changes(self, instance_id, check_source=True):
         instance = self.get(instance_id)
         current = file_manifest(instance["code_root"], self._digest_cache)

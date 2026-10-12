@@ -20,7 +20,7 @@ from textual.worker import Worker, WorkerState
 
 from ianvs_agent.app.records import assistant_text, conversation_messages, environment_text, short_text, tool_display_status, tool_parameters, tool_summary
 from ianvs_agent.app.logs import ReflowRichLog, RunOutputBuffer
-from ianvs_agent.app.screens import ApprovalScreen, ExitScreen, ToolDetailsScreen
+from ianvs_agent.app.screens import ApprovalScreen, DeleteInstanceScreen, ExitScreen, ToolDetailsScreen
 from ianvs_agent.message_types import format_task_result
 
 
@@ -99,7 +99,7 @@ EVENT_LABELS = {
     "testcase.started": "测试对象开始执行", "testcase.completed": "测试对象执行完成",
     "testcase.failed": "测试对象执行失败",
     "approval.completed": "操作审批完成", "approval.decided": "操作审批完成", "instance.created": "实例已创建",
-    "instance.selected": "实例已选择", "instance.changed": "实例文件已变化",
+    "instance.selected": "实例已选择", "instance.changed": "实例文件已变化", "instance.deleted": "实例已删除", "instance.deletion_failed": "实例删除失败",
     "environment.started": "正在准备环境", "environment.completed": "环境准备完成",
     "environment.prepared": "环境准备完成", "environment.failed": "环境准备失败",
     "environment.step_started": "环境步骤开始", "environment.step_completed": "环境步骤完成",
@@ -183,6 +183,7 @@ class IanvsAgentApp(App):
         self._active_action = None
         self._approvals = []
         self._approval_open = False
+        self._delete_open = False
         self._cancelling = False
         self._last_context_fraction = None
         self._last_status = "就绪，请选择示例或恢复实例"
@@ -223,6 +224,7 @@ class IanvsAgentApp(App):
                 yield Static("恢复已有实例", classes="field-label")
                 yield Select([], prompt="选择实例", id="instance-select")
                 yield Static("尚未选择实例", id="instance-info", markup=False)
+                yield Button("删除当前实例", id="delete-instance", variant="error", disabled=True)
                 yield Button("准备运行环境", id="prepare-environment")
                 yield Button("运行当前示例", id="run-example", variant="success")
                 yield Button("继续原任务 · F7", id="resume-task", variant="primary", disabled=True)
@@ -388,7 +390,22 @@ class IanvsAgentApp(App):
         current = self.harness.current_instance
         if current:
             selector.value = current["instance_id"]
+        else:
+            selector.value = Select.BLANK
         self._refreshing = False
+
+    def clear_instance_views(self):
+        self.restore_conversation()
+        self.action_show_diff(activate=False)
+        self.refresh_usage()
+        self.action_show_verification(activate=False)
+        self.query_one("#main-tabs", TabbedContent).active = "conversation"
+        self.query_one("#message-input", Input).value = ""
+        self.query_one("#run-status", Static).update("尚未运行")
+        self._last_status = "实例已删除，请选择示例并创建实例，或恢复已有实例"
+        self.end_activity()
+        self.refresh_instances()
+        self.refresh_status()
 
     def restore_conversation(self):
         log = self.query_one("#conversation-log", RichLog)
@@ -693,6 +710,7 @@ class IanvsAgentApp(App):
         busy = not self.backend_ready() or self.harness.busy or self._active_action is not None
         self.query_one("#create-instance", Button).disabled = busy or self.selected_example is None
         self.query_one("#prepare-environment", Button).disabled = busy or current is None
+        self.query_one("#delete-instance", Button).disabled = busy or current is None or self._delete_open
         self.query_one("#run-example", Button).disabled = busy or current is None
         self.query_one("#resume-task", Button).disabled = busy or current is None or not self.harness.task or self.harness.state.get("status") not in {"failed", "blocked", "cancelled", "interrupted"}
         self.query_one("#send-message", Button).disabled = busy or current is None
@@ -772,17 +790,21 @@ class IanvsAgentApp(App):
             self._active_action = None
             self.clear_stream()
             self.end_activity()
+            if self.harness.current_instance is None and self._displayed_session_id is not None:
+                self.clear_instance_views()
             if worker.state == WorkerState.ERROR:
                 self._last_status = f"操作失败：{worker.error}"
                 self.query_one("#run-log", RichLog).write(Text(self._last_status, style="#fca5a5"))
                 self.notify(str(worker.error), title="操作失败", severity="error", timeout=10, markup=False)
             elif worker.state == WorkerState.CANCELLED:
-                self._last_status = "任务已取消，已有记录已经保存"
+                self._last_status = "删除操作已取消，请查看实例列表与后端清理状态" if worker.name == "正在永久删除实例" else "任务已取消，已有记录已经保存"
             else:
                 task_status = self.harness.state.get("status")
                 if worker.name == "正在准备独立运行环境":
                     environment = (self.harness.current_instance or {}).get("environment") or {}
                     self._last_status = environment.get("summary") or "声明的运行环境已准备，可以运行当前示例"
+                elif worker.name == "正在永久删除实例":
+                    self._last_status = "实例已删除，请选择示例并创建实例，或恢复已有实例"
                 elif task_status == "blocked":
                     self._last_status = "智能体任务阻塞，原因与已有证据已经保存"
                 elif task_status == "completed" and self.harness.task.get("kind") == "conversation":
@@ -850,6 +872,35 @@ class IanvsAgentApp(App):
             return
         path = self.selected_example["benchmark_path"]
         self.start_action(lambda: self.harness.create_instance(path), "正在创建独立实例")
+
+    @on(Button.Pressed, "#delete-instance")
+    def delete_instance_button(self):
+        if not self.require_instance() or self._delete_open:
+            return
+        if self.harness.busy or self._active_action is not None:
+            self.notify("请取消当前任务后删除实例。", title="任务进行中", severity="warning")
+            return
+        instance = self.harness.current_instance
+        instance_id = instance["instance_id"]
+        self._delete_open = True
+        self.push_screen(DeleteInstanceScreen(instance), lambda confirmed: self.delete_instance_decision(instance_id, confirmed))
+        self.refresh_status()
+
+    def delete_instance_decision(self, instance_id, confirmed):
+        self._delete_open = False
+        self.refresh_status()
+        if not confirmed:
+            return
+        current = self.harness.current_instance
+        if current is None or current["instance_id"] != instance_id:
+            self.notify("当前选择的实例已经变化，请重新确认删除。", title="实例已变化", severity="warning")
+            return
+        self.start_action(lambda: self.delete_instance(instance_id), "正在永久删除实例")
+
+    async def delete_instance(self, instance_id):
+        result = await self.harness.delete_instance(instance_id)
+        self.clear_instance_views()
+        return result
 
     @on(Button.Pressed, "#prepare-environment")
     def prepare_environment_button(self):
@@ -953,19 +1004,29 @@ class IanvsAgentApp(App):
 
     async def cancel_action(self):
         self._cancelling = True
+        keep_activity = False
+        deletion_worker = self._active_action if self._active_action and self._active_action.name == "正在永久删除实例" else None
         self.begin_activity("正在取消当前任务并保存记录")
         try:
             self._approvals.clear()
             if isinstance(self.screen, ApprovalScreen):
                 await self.screen.dismiss(False)
-            await self.harness.cancel()
+            result = await self.harness.cancel()
+            if deletion_worker is not None or isinstance(result, dict) and result.get("status") == "deleting":
+                if deletion_worker is self._active_action and deletion_worker is not None and deletion_worker.is_running:
+                    keep_activity = True
+                    self._last_status = "永久删除正在继续，请等待完成"
+                    self.begin_activity(self._last_status)
+                    self.notify(self._last_status, title="删除实例")
+                return
             if self._active_action:
                 self._active_action.cancel()
             self._last_status = "取消请求已处理，已有记录已经保存"
         finally:
             self._cancelling = False
             self.clear_stream()
-            self.end_activity()
+            if not keep_activity:
+                self.end_activity()
             self.refresh_status()
 
     @on(TabbedContent.TabActivated, "#main-tabs")
@@ -979,12 +1040,13 @@ class IanvsAgentApp(App):
         elif event.pane.id == "verification":
             self.action_show_verification()
 
-    def action_show_diff(self):
+    def action_show_diff(self, *, activate=True):
         log = self.query_one("#diff-log", RichLog)
         log.clear()
         diff = self.harness.diff()
         log.write(Syntax(diff, "diff", theme="monokai", word_wrap=False) if diff else Text("当前实例尚无代码修改。", style="#94a3b8"))
-        self.query_one("#main-tabs", TabbedContent).active = "diff"
+        if activate:
+            self.query_one("#main-tabs", TabbedContent).active = "diff"
 
     def refresh_usage(self, summary=None):
         summary = self.harness.usage_summary() if summary is None else summary
@@ -1014,7 +1076,7 @@ class IanvsAgentApp(App):
         self.refresh_usage()
         self.query_one("#main-tabs", TabbedContent).active = "usage"
 
-    def action_show_verification(self):
+    def action_show_verification(self, *, activate=True):
         report = self.harness.verification_report()
         lines = ["独立验证报告"]
         if not report:
@@ -1060,7 +1122,8 @@ class IanvsAgentApp(App):
                 else:
                     lines.append(str(check))
         self.query_one("#verification-detail", Static).update(Text("\n".join(lines)))
-        self.query_one("#main-tabs", TabbedContent).active = "verification"
+        if activate:
+            self.query_one("#main-tabs", TabbedContent).active = "verification"
 
     def format_event(self, event):
         event_type = event["event_type"]
@@ -1094,6 +1157,9 @@ class IanvsAgentApp(App):
         if not self.is_running:
             return
         event = message.event
+        if event["event_type"] == "instance.deleted" and self.harness.current_instance is None:
+            self.clear_instance_views()
+            return
         if event["event_type"] in {"session.started", "session.resumed"} and event.get("session_id") != self._displayed_session_id:
             self.restore_conversation()
         identity = event.get("event_id")

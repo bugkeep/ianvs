@@ -36,6 +36,9 @@
 
 ## Runtime
 
+- `InstanceManager.preview_deletion(instance_id)` 核对确切受管理路径、实例与全部历史/失败候选环境归属，以及所属活动进程；`delete(instance_id)` 返回 `instance_id,name,status,environment_ids,deletion_ref`。正式操作记录位于 `instance-deletions/<id>/deletion.json`，先将已核对目录移动至该记录目录的 `data/` 后永久清理；只有全部清理完成才保存 `status=deleted`。`recover_pending_deletions()` 继续未完成操作，逐项报告失败，保留其他实例可用。原项目、外部数据、共享来源对象、全局事件及计数器不属于清理目标。
+- `sandboxed_command(...,network=False,pip_timeout_seconds=60,pip_retries=5)` 保留 Bubblewrap 的 `--clearenv`。仅联网步骤通过 `sandbox_network()` 的封印内存 FD 注入代理白名单，进程参数及正式记录不含代理值；输出使用 `SecretRedactor` 跨分块脱敏。预检、启动失败、取消和正常结束均关闭父进程 FD；禁网步骤不注入代理。
+
 - `ExampleCatalog(project_root).list_examples() -> list[dict]`：`benchmark_path,name,readme_path,inventory_entry`。
 - `InstanceManager(settings,store,events)`：`create(benchmark_path,name=None) -> dict`；`list_instances()`；`get(instance_id)`；`check_changes(instance_id)`；记录 `code_root,benchmark_path,readme_path,environment,status,verification`。
 - `OriginalGoalStore(settings,store)`：`capture(instance)` 保存创建文件原字节与只写一次的 manifest，`resolve(instance)` 恢复或补充来源版本，`load(instance,reference=None)` 核查记录摘要、实例身份、创建 manifest 和绑定对象的内容摘要。对象放在 `original-goals/objects/`，实例 manifest 和目标版本放在 `instances/<id>/original-goals/`，均位于可修改的 `code/` 之外；同内容去重，工作文件不与对象共享可修改字节。
@@ -65,6 +68,8 @@
 - core 增加可选轻量事件回调，普通 CLI 保持兼容；`--agent` 延迟导入 TUI，且与 `-f` 互斥。
 
 ## Harness / Tools / TUI
+
+- `async AgentHarness.delete_instance(instance_id)` 拒绝忙碌任务、待审批及活动环境操作；核对删除范围后清除当前实例、会话、工具状态、Provider/Context/Usage 引用和 EventBus 绑定，再执行永久清理。事件 `instance.deleted` 显式使用 `session_id=None`，不会重新创建已删除目录。stdio 删除 RPC 与 `snapshot_lock` 串行，发布新的完整快照；前端通过 `RemoteHarness.delete_instance()` 调用，删除后复位全部实例视图。TUI 确认弹窗绑定实例编号，默认取消；永久清理已经开始时，取消动作继续等待清理结果。
 
 - `AgentHarness(settings)`：`.catalog,.instances,.environment,.runner,.verifier,.store,.events,.usage,.provider,.context,.session,.current_instance,.busy`。
 - `select_instance(instance_id)` 用于初始化；`async restore_instance(instance_id)` 用于界面切换；`async create_instance(benchmark_path)`；`async prepare_instance()`；`async run_current()`；`async send_message(text)`；`async compact()`；`async cancel()`；`switch_model(profile_name)`；`async approve(approval_id,approved)`；`history()`；`diff()`；`usage_summary()`；`verification_report()`；`async close()`。
