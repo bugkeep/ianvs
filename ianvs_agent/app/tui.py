@@ -813,7 +813,7 @@ class IanvsAgentApp(App):
     @on(DataTable.RowSelected, "#example-table")
     def choose_example(self, event: DataTable.RowSelected):
         self.selected_example = self.examples[int(event.row_key.value)]
-        self.action_create_instance()
+        self.refresh_status()
 
     @on(Select.Changed, "#instance-select")
     def choose_instance(self, event: Select.Changed):
