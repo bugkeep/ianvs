@@ -17,6 +17,7 @@
 import copy
 
 from core.common import utils
+from core.common.events import emit_event
 from core.common.constant import TestObjectType
 from core.testcasecontroller.algorithm import Algorithm
 from core.testcasecontroller.testcase import TestCase
@@ -42,6 +43,11 @@ class TestCaseController:
             algorithms = self._parse_algorithms_config(test_object_config)
             for algorithm in algorithms:
                 self.test_cases.append(TestCase(test_env, algorithm))
+        emit_event("testcases.built", testcases=[
+            {"testcase_id": str(case.id), "algorithm": case.algorithm.name,
+             "paradigm": case.algorithm.paradigm_type}
+            for case in self.test_cases
+        ])
 
     def run_testcases(self, workspace):
         """

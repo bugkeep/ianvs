@@ -18,6 +18,7 @@
 import os
 
 from core.common import utils
+from core.common.events import emit_event, stage
 from core.common.constant import TestObjectType
 from core.testenvmanager.testenv import TestEnv
 from core.storymanager.rank import Rank
@@ -84,18 +85,25 @@ class BenchmarkingJob:
         self.workspace = os.path.join(self.workspace, self.name)
 
         if self.simulation is not None:
+            stage("simulation_prepare")
             build_simulation_enviroment(self.simulation)
 
+        stage("dataset_prepare")
         self.test_env.prepare()
 
+        stage("testcase_build")
         self.testcase_controller.build_testcases(test_env=self.test_env,
                                                  test_object=self.test_object)
 
+        stage("testcase_execution")
         succeed_testcases, test_results = self.testcase_controller.run_testcases(self.workspace)
 
         if test_results:
+            stage("rank_output")
             self.rank.save(succeed_testcases, test_results, output_dir=self.workspace)
             self.rank.plot()
+            emit_event("rank.completed", all_rank_file=self.rank.all_rank_file,
+                       selected_rank_file=self.rank.selected_rank_file)
 
     def _parse_config(self, config: dict):
         # pylint: disable=C0103

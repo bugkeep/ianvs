@@ -1,0 +1,14 @@
+textual>=1.0,<7
+openai>=1.60,<3
+httpx>=0.27,<1
+pydantic>=2.8,<3
+PyYAML>=6.0.1,<7
+python-dotenv>=1.0,<2
+tiktoken>=0.9,<1
+filelock>=3.16,<4
+patch-ng>=1.18,<2
+markdown-it-py>=3,<5
+psutil>=6,<8
+jsonschema>=4.22,<5
+charset-normalizer>=3.3,<4
+packaging>=24.0

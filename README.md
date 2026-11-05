@@ -65,6 +65,10 @@ Documentation is located on [readthedoc.io](https://ianvs.readthedocs.io/). The 
 
 Follow the [Ianvs installation document](docs/guides/how-to-install-ianvs.md) to install Ianvs.
 
+### Ianvs Agent
+
+[Ianvs Agent](ianvs_agent/README.md) provides a terminal interface for Example selection, isolated instances, environment preparation, diagnosis, code changes, and independent verification. It requires Python 3.11 or newer; Windows uses a local TUI with a WSL execution backend. After installing and configuring the Agent, start it from the repository root with `ianvs --agent`.
+
 ### Examples
 
 - Scenario PCB-AoI：[Industrial Defect Detection on the PCB-AoI Dataset](docs/proposals/scenarios/industrial-defect-detection/pcb-aoi.md).
